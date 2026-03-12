@@ -2,3 +2,8 @@
 *.JPG
 *.AVI
 *.THM
+*.SVG
+*.mat
+*.yml
+
+pyMLV/*
