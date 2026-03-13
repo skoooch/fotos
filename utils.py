@@ -8,6 +8,8 @@ from MLVcode.computeOrientation import computeOrientation
 from MLVcode.computeLength import computeLength
 from MLVcode.computeCurvature import computeCurvature
 from MLVcode.drawLinedrawingProperty import drawLinedrawingProperty
+from scipy.ndimage import distance_transform_edt
+import pickle
 
 
 def create_reduced_dir(in_folder, out_folder, scale=2.5):
@@ -68,8 +70,7 @@ def get_sobel_img(filepath, out_fp=None):
 def get_canny_img(filepath, out_fp=None):
     img = cv.imread(filepath, cv.IMREAD_GRAYSCALE)
     edges = cv.Canny(img, 300, 300)
-    print(edges.shape)
-    exit()
+
     if out_fp == None:
         return edges
     else:
@@ -175,7 +176,9 @@ def create_vectorized_edge_folder(in_folder):
         )
 
 
-def compute_contour_info(fp, contour_reduce_percent=0):
+def compute_contour_info(
+    fp, contour_reduce_percent=0, save=True, save_fn="vecLDs_processed.pickle"
+):
     vecLD_arr = load_mat(fp)
 
     for fn, vec in zip(
@@ -187,10 +190,50 @@ def compute_contour_info(fp, contour_reduce_percent=0):
         if contour_reduce_percent:
             delete_contours(vec, contour_reduce_percent)
 
-        drawLinedrawingProperty(vec, "length", fn=fn)
+        # drawLinedrawingProperty(vec, "length", fn=fn)
 
         # drawLinedrawingProperty(vec, "curvature", fn=fn)
+        print(f"Processed image {fn}")
+    if save:
+        with open(save_fn, "wb") as f:
+            # Use pickle.HIGHEST_PROTOCOL for maximum speed
+            pickle.dump(vecLD_arr, f, pickle.HIGHEST_PROTOCOL)
     return vecLD_arr
+
+
+def get_vecLDs(fn):
+    with open(fn, "rb") as f:
+        # Read the data from the binary file
+        vecLDs = pickle.load(f)
+    return vecLDs
+
+
+def get_vecLD_by_filename(vecLD_arr):
+    """Build a dict mapping filename -> vecLD for quick lookup.
+
+    Args:
+        vecLD_arr: The full data structure returned by compute_contour_info / load_mat.
+
+    Returns:
+        dict: {filename: vecLD}
+    """
+    return {
+        fn: vec
+        for fn, vec in zip(
+            vecLD_arr["allVecLDs"]["filename"],
+            vecLD_arr["allVecLDs"]["vecLD"],
+        )
+    }
+
+
+def get_binary_by_filename(vecLD_arr):
+    return {
+        fn: vecLD_to_binary_image(vec)
+        for fn, vec in zip(
+            vecLD_arr["allVecLDs"]["filename"],
+            vecLD_arr["allVecLDs"]["vecLD"],
+        )
+    }
 
 
 def delete_contours(vecLD, contour_reduce_percent):
@@ -284,28 +327,24 @@ def compute_distance(vec1, vec2, tile_width, tile1_x, tile1_y, tile2_x, tile2_y)
     return max(d_ab, d_ba)
 
 
-def test_distances(vec1, vec2):
-    tile_ratio = 0.5
-    stride = 10
-    w = vec1["imsize"][0] * tile_ratio
-    m_h, m_w = vec1["imsize"][0], vec1["imsize"][1]
-    distances = {}
-    for i_1 in range(0, int(m_h - w), stride):
-        for j_1 in range(0, int(m_w - w), stride):
-            for i_2 in range(0, int(m_h - w), stride):
-                for j_2 in range(0, int(m_w - w), stride):
-                    distances[(i_1, j_1, i_2, j_2)] = compute_distance(
-                        vec1, vec2, w, i_1, j_1, i_2, i_2
-                    )
-    max_key = max(distances, key=lambda k: distances[k])
-    print("Max distance key:", max_key)
+def vecLD_to_binary_image(vecLD):
+    """Rasterize a vecLD into a binary edge image."""
+    h, w = int(vecLD["imsize"][0]), int(vecLD["imsize"][1])
+    img = np.zeros((h, w), dtype=np.uint8)
+    for c in range(int(vecLD["numContours"])):
+        contour = vecLD["contours"][c]
+        if len(contour.shape) == 1:
+            contour = contour[None, :]
+        for seg in contour:
+            x1, y1, x2, y2 = int(seg[0]), int(seg[1]), int(seg[2]), int(seg[3])
+            cv.line(img, (x1, y1), (x2, y2), 1, thickness=1)
+    return img
 
 
 if __name__ == "__main__":
     # create_reduced_dir("cusco_salkantay", "cusco_salkantay_med", scale=2.5)
     # create_sobel_folder("cusco_salkantay_small")
-    vecLD_arr = compute_contour_info("smallVecLDs.mat", 95)
-    test_distances(
-        vecLD_arr["allVecLDs"]["vecLD"][0], vecLD_arr["allVecLDs"]["vecLD"][1]
-    )
+    vecLD_arr = compute_contour_info("cusco_salkantay_med_vec/vecLDs.mat", 95, True)
+    exit()
+
     # create_vectorized_edge_folder("cusco_salkantay_med")
