@@ -4,6 +4,8 @@
 *.THM
 *.SVG
 *.mat
+*.png
 *.yml
-
-pyMLV/*
+MLVcode/__pycache__*
+MLVcode/.DS_Store*
+!smallVecLDs.mat

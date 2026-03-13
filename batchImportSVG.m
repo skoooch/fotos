@@ -32,7 +32,7 @@ fprintf('Found %d SVG files in %s\n', numel(svgFiles), svgFolder);
 
 allVecLDs = struct('filename', {}, 'vecLD', {});
 
-for i = 1:numel(svgFiles)
+for i = 1:5
     svgPath = fullfile(svgFolder, svgFiles(i).name)
     fprintf('[%d/%d] Importing %s ...', i, numel(svgFiles), svgFiles(i).name);
     

@@ -499,12 +499,12 @@ end
 
 % local function to get attribute values
 function attrValue = getValue(theNode,attrName)
-attrString = getAttribute(theNode,attrName)
+attrString = getAttribute(theNode,attrName);
 if isempty(attrString)
     attrValue = [];
 else
-    attrValue = sscanf(attrString,'%f')
+    attrValue = sscanf(attrString,'%f');
     attrString(attrString == ',') = ' ';
-    attrValue = sscanf(attrString,'%f')
+    attrValue = sscanf(attrString,'%f');
 end
 end
