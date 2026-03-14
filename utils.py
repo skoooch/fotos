@@ -343,7 +343,7 @@ def vecLD_to_binary_image(vecLD):
 
 
 if __name__ == "__main__":
-    create_reduced_dir("cusco_salkantay", "cusco_salkantay_med", scale=2.5)
+    create_reduced_dir("../../Downloads/Photos-3-001", "cusco_salkantay_med", scale=2.5)
     # create_sobel_folder("cusco_salkantay_small")
 
     # vecLD_arr = compute_contour_info("cusco_salkantay_med_vec/vecLDs.mat", 95, True)
