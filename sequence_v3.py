@@ -24,13 +24,16 @@ from scipy.spatial.distance import cdist
 
 # ── Config ──────────────────────────────────────────────────────────────────
 TILE_RATIO = 0.5
-STRIDE = 20
+STRIDE = 25
 EDGE_BLUR_KSIZE = 3
 NUM_2OPT_ITERATIONS = 50
 K_NEIGHBORS = 15  # only tile-match the K most promising neighbors per image
 TARGET_SHORT_EDGE = 512
 EDGE_THRESHOLD = 0.1
 MIN_EDGE_DENSITY = 0.01
+REFINE_STRIDE = 3       # fine-grained stride for tile refinement
+REFINE_RADIUS = 2   # search radius (pixels) around current tile position
+REFINE_ITERATIONS = 3   # number of forward+backward sweeps
 
 
 # ── Edge Extraction ─────────────────────────────────────────────────────────
@@ -396,6 +399,215 @@ def two_opt(path, cost_matrix, max_iterations=NUM_2OPT_ITERATIONS):
     return best, best_cost
 
 
+# ── Tile Position Refinement ────────────────────────────────────────────────
+
+
+def _chamfer_cost(tile_a, tile_b, threshold=EDGE_THRESHOLD):
+    """
+    Compute symmetric weighted Chamfer distance between two edge tiles.
+    Both inputs should be same-sized float32 edge-strength maps.
+    """
+    mask_a = tile_a > threshold
+    mask_b = tile_b > threshold
+
+    w_a = tile_a[mask_a]
+    w_b = tile_b[mask_b]
+    sum_wa = w_a.sum()
+    sum_wb = w_b.sum()
+
+    if sum_wa == 0 or sum_wb == 0:
+        return inf
+
+    dt_a = distance_transform_edt(~mask_a)
+    dt_b = distance_transform_edt(~mask_b)
+
+    d_ab = np.sum(w_a * dt_b[mask_a]) / sum_wa
+    d_ba = np.sum(w_b * dt_a[mask_b]) / sum_wb
+    return (d_ab + d_ba) / 2.0
+
+
+def refine_tile_positions(
+    path,
+    filenames,
+    edge_maps,
+    tile_info,
+    tile_ratio=TILE_RATIO,
+    refine_stride=REFINE_STRIDE,
+    refine_radius=REFINE_RADIUS,
+    num_iterations=REFINE_ITERATIONS,
+):
+    """
+    After sequencing, refine each image's tile position to minimize the
+    sum of Chamfer distances to its predecessor and successor.
+
+    This uses a much finer stride than the initial tile matching, since
+    we only search a small neighborhood around the current position and
+    only consider adjacent pairs.
+
+    Strategy:
+      - For each image i in the sequence, its tile position affects:
+        cost(i-1, i) and cost(i, i+1).
+      - We search a small window around the current tile position and
+        pick the position that minimizes the sum of both adjacent costs.
+      - Sweep forward and backward multiple times until convergence.
+
+    Returns:
+        refined_positions: list of (tile_y, tile_x, tile_size) per sequence index
+    """
+    n = len(path)
+
+    # Initialize positions from tile_info
+    positions = []  # (ty, tx, ts) for each index in path order
+    for k, idx in enumerate(path):
+        fn = filenames[idx]
+        em = edge_maps[fn]
+        h, w = em.shape
+        if k == 0:
+            ts = int(min(h, w) * tile_ratio)
+            ty, tx = (h - ts) // 2, (w - ts) // 2
+        else:
+            prev_idx = path[k - 1]
+            key = (prev_idx, idx)
+            info = tile_info.get(key)
+            if info:
+                ty, tx = info[1]
+                ts = info[2]
+            else:
+                ts = int(min(h, w) * tile_ratio)
+                ty, tx = (h - ts) // 2, (w - ts) // 2
+        positions.append((ty, tx, ts))
+
+    def get_tile(seq_idx):
+        """Extract the current tile for a given sequence position."""
+        idx = path[seq_idx]
+        fn = filenames[idx]
+        em = edge_maps[fn]
+        ty, tx, ts = positions[seq_idx]
+        return em[ty : ty + ts, tx : tx + ts]
+
+    def compute_total_cost():
+        """Compute total adjacent Chamfer cost for the current positions."""
+        total = 0.0
+        for k in range(n - 1):
+            t_a = get_tile(k)
+            t_b = get_tile(k + 1)
+            if t_a.shape == t_b.shape and t_a.size > 0:
+                total += _chamfer_cost(t_a, t_b)
+        return total
+
+    initial_cost = compute_total_cost()
+    print(f"    Refinement initial cost: {initial_cost:.2f}")
+
+    for iteration in range(num_iterations):
+        changed = False
+
+        # Forward sweep: refine positions[1], positions[2], ..., positions[n-2]
+        # Backward sweep: refine positions[n-2], ..., positions[1]
+        sweep_order = list(range(1, n - 1)) + list(range(n - 2, 0, -1))
+        # Also include first and last with partial constraints
+        sweep_order = [0] + sweep_order + [n - 1]
+
+        for k in sweep_order:
+            with open("tile_matching.log", "a") as log:
+                    log.write(f"{iteration - k}\n")
+            idx = path[k]
+            fn = filenames[idx]
+            em = edge_maps[fn]
+            h, w = em.shape
+            cur_ty, cur_tx, ts = positions[k]
+
+            # Determine which neighbors to consider
+            neighbors = []
+            if k > 0:
+                neighbors.append(k - 1)
+            if k < n - 1:
+                neighbors.append(k + 1)
+
+            if not neighbors:
+                continue
+
+            # Get neighbor tiles (fixed during this step)
+            neighbor_tiles = []
+            for nk in neighbors:
+                nt = get_tile(nk)
+                neighbor_tiles.append(nt)
+
+            # Search window around current position
+            y_min = max(0, cur_ty - refine_radius)
+            y_max = min(h - ts, cur_ty + refine_radius)
+            x_min = max(0, cur_tx - refine_radius)
+            x_max = min(w - ts, cur_tx + refine_radius)
+
+            if y_max < y_min or x_max < x_min:
+                continue
+
+            best_cost = inf
+            best_pos = (cur_ty, cur_tx)
+
+            # Evaluate current position first
+            cur_tile = em[cur_ty : cur_ty + ts, cur_tx : cur_tx + ts]
+            if cur_tile.shape[0] == ts and cur_tile.shape[1] == ts:
+                cur_cost = 0.0
+                valid = True
+                for nt in neighbor_tiles:
+                    if nt.shape == cur_tile.shape:
+                        cur_cost += _chamfer_cost(cur_tile, nt)
+                    else:
+                        valid = False
+                        break
+                if valid:
+                    best_cost = cur_cost
+                    best_pos = (cur_ty, cur_tx)
+
+            # Search the neighborhood
+            for ty in range(y_min, y_max + 1, refine_stride):
+                for tx in range(x_min, x_max + 1, refine_stride):
+                    if ty == cur_ty and tx == cur_tx:
+                        continue  # already evaluated
+
+                    candidate = em[ty : ty + ts, tx : tx + ts]
+                    if candidate.shape[0] != ts or candidate.shape[1] != ts:
+                        continue
+
+                    cost = 0.0
+                    skip = False
+                    for nt in neighbor_tiles:
+                        if nt.shape != candidate.shape:
+                            skip = True
+                            break
+                        c = _chamfer_cost(candidate, nt)
+                        cost += c
+                        if cost >= best_cost:
+                            skip = True
+                            break
+                    if skip:
+                        continue
+
+                    if cost < best_cost:
+                        best_cost = cost
+                        best_pos = (ty, tx)
+
+            if best_pos != (cur_ty, cur_tx):
+                positions[k] = (best_pos[0], best_pos[1], ts)
+                changed = True
+
+        new_cost = compute_total_cost()
+        print(f"    Refinement iteration {iteration + 1}: cost = {new_cost:.2f}")
+
+        if not changed:
+            print(f"    Converged after {iteration + 1} iterations.")
+            break
+
+    final_cost = compute_total_cost()
+    improvement = initial_cost - final_cost
+    print(
+        f"    Refinement done: {initial_cost:.2f} → {final_cost:.2f} "
+        f"(improved by {improvement:.2f}, {100*improvement/initial_cost:.1f}%)"
+    )
+
+    return positions
+
+
 # ── Main Sequencing Pipeline ────────────────────────────────────────────────
 
 
@@ -485,24 +697,18 @@ def sequence(
     path, final_cost = two_opt(path, cost_matrix)
     print(f"  Final cost:  {final_cost:.2f}\n")
 
+    print("Step 5: Fine-grained tile position refinement...")
+    refined_positions = refine_tile_positions(
+        path, filenames, edge_maps, tile_info
+    )
+    print()
+
     with open(output_file, "w") as f:
         for k, idx in enumerate(path):
             fn = filenames[idx]
             em = edge_maps[fn]
             h, w = em.shape
-            if k == 0:
-                ts = int(min(h, w) * TILE_RATIO)
-                ty, tx = (h - ts) // 2, (w - ts) // 2
-            else:
-                prev_idx = path[k - 1]
-                key = (prev_idx, idx)
-                info = tile_info.get(key)
-                if info:
-                    ty, tx = info[1]
-                    ts = info[2]
-                else:
-                    ts = int(min(h, w) * TILE_RATIO)
-                    ty, tx = (h - ts) // 2, (w - ts) // 2
+            ty, tx, ts = refined_positions[k]
             f.write(f"{fn},{ty},{tx},{h},{w}\n")
 
     print(f"Sequence written to {output_file}")
