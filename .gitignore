@@ -6,6 +6,7 @@
 *.mat
 *.png
 *.yml
+!cusco_salkantay_med/*
 MLVcode/__pycache__*
 MLVcode/.DS_Store*
 !smallVecLDs.mat
