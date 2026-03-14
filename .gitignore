@@ -11,3 +11,5 @@ MLVcode/__pycache__*
 MLVcode/.DS_Store*
 !smallVecLDs.mat
 .venv/*
+*.pkl
+*.log
