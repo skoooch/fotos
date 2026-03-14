@@ -14,12 +14,15 @@ import sys
 import pickle
 from math import inf
 from itertools import combinations
-from concurrent.futures import ProcessPoolExecutor, as_completed
-
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import cv2 as cv
 from scipy.ndimage import distance_transform_edt
 from scipy.spatial.distance import cdist
+
+import torch
+import open_clip
+from PIL import Image
 
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -27,13 +30,54 @@ TILE_RATIO = 0.75
 STRIDE = 25
 EDGE_BLUR_KSIZE = 3
 NUM_2OPT_ITERATIONS = 50
-K_NEIGHBORS = 15  # only tile-match the K most promising neighbors per image
+K_NEIGHBORS = 30  # only tile-match the K most promising neighbors per image
 TARGET_SHORT_EDGE = 512
 EDGE_THRESHOLD = 0.1
 MIN_EDGE_DENSITY = 0.01
 REFINE_STRIDE = 8  # fine-grained stride for tile refinement
 REFINE_RADIUS = 25  # search radius (pixels) around current tile position
 REFINE_ITERATIONS = 10  # number of forward+backward sweeps
+DISTANCE_METRIC = "embedding"  # "edge_descript", "embedding", or "combined"
+EMBEDDING_WEIGHT = 0.5  # weight for embedding distance in combined mode
+
+# ── CLIP Embedding Cache ────────────────────────────────────────────────────
+
+_clip_model = None
+_clip_preprocess = None
+_clip_device = None
+
+
+def _load_clip_model():
+    """Lazily load the CLIP model (once per process)."""
+    global _clip_model, _clip_preprocess, _clip_device
+    if _clip_model is not None:
+        return _clip_model, _clip_preprocess, _clip_device
+
+    _clip_device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"  Loading CLIP model on {_clip_device}...")
+    _clip_model, _, _clip_preprocess = open_clip.create_model_and_transforms(
+        "ViT-B-32", pretrained="laion2b_s34b_b79k"
+    )
+    _clip_model = _clip_model.to(_clip_device)
+    _clip_model.eval()
+    print(f"  CLIP model loaded.")
+    return _clip_model, _clip_preprocess, _clip_device
+
+
+def _unload_clip_model():
+    """Free CLIP model memory before heavy multiprocessing."""
+    global _clip_model, _clip_preprocess, _clip_device
+    if _clip_model is not None:
+        del _clip_model
+        _clip_model = None
+        _clip_preprocess = None
+        _clip_device = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        import gc
+
+        gc.collect()
+        print("  CLIP model unloaded to free memory.")
 
 
 # ── Edge Extraction ─────────────────────────────────────────────────────────
@@ -65,6 +109,56 @@ def get_weighted_edges(image_path, target_short_edge=TARGET_SHORT_EDGE):
 
 
 # ── Cheap Global Descriptor ────────────────────────────────────────────────
+
+
+def compute_image_features(filenames, image_folder):
+    """
+    Compute CLIP embeddings for all images.
+
+    Args:
+        filenames: list of image filenames
+        image_folder: path to folder containing the images
+
+    Returns:
+        np.ndarray of shape (n, embedding_dim), L2-normalized
+    """
+    model, preprocess, device = _load_clip_model()
+
+    embeddings = []
+    batch_size = 32
+    print(f"  Computing CLIP embeddings for {len(filenames)} images...")
+
+    for batch_start in range(0, len(filenames), batch_size):
+        batch_fns = filenames[batch_start : batch_start + batch_size]
+        batch_tensors = []
+        for fn in batch_fns:
+            path = os.path.join(image_folder, fn)
+            try:
+                pil_img = Image.open(path).convert("RGB")
+                tensor = preprocess(pil_img)
+                batch_tensors.append(tensor)
+            except Exception as e:
+                print(f"    CLIP skip {fn}: {e}")
+                # Use a zero vector as fallback
+                batch_tensors.append(torch.zeros(3, 224, 224))
+
+        batch = torch.stack(batch_tensors).to(device)
+        with torch.no_grad(), torch.amp.autocast(
+            device_type=device if device != "cpu" else "cpu"
+        ):
+            features = model.encode_image(batch)
+            features = features.float()
+            features /= features.norm(dim=-1, keepdim=True)
+
+        embeddings.append(features.cpu().numpy())
+
+        done = min(batch_start + batch_size, len(filenames))
+        if done % 100 == 0 or done == len(filenames):
+            print(f"    {done}/{len(filenames)} embeddings computed")
+
+    embeddings = np.vstack(embeddings)
+    print(f"  CLIP embeddings shape: {embeddings.shape}")
+    return embeddings.astype(np.float32)
 
 
 def compute_edge_descriptor(edge_map, num_spatial_bins=4, num_orient_bins=8):
@@ -217,10 +311,17 @@ def build_edge_maps(image_folder, extensions=(".jpg", ".jpeg", ".png", ".tif", "
     return edge_maps
 
 
-def build_knn_shortlist(edge_maps, k=K_NEIGHBORS):
+def build_knn_shortlist(
+    edge_maps, k=K_NEIGHBORS, distance_metric=DISTANCE_METRIC, image_folder=None
+):
     """
-    Compute cheap global descriptors for all images and find the
-    K nearest neighbors for each image using cosine distance.
+    Compute global descriptors for all images and find the
+    K nearest neighbors for each image.
+
+    distance_metric options:
+      - "edge_descript": HOG-like edge descriptor (cosine distance)
+      - "embedding": CLIP semantic embedding (cosine distance)
+      - "combined": weighted combination of both
 
     Returns:
         filenames: list[str]
@@ -230,12 +331,53 @@ def build_knn_shortlist(edge_maps, k=K_NEIGHBORS):
     filenames = list(edge_maps.keys())
     n = len(filenames)
 
-    print(f"  Computing descriptors for {n} images...")
-    descriptors = np.array([compute_edge_descriptor(edge_maps[fn]) for fn in filenames])
+    if distance_metric == "edge_descript":
+        print(f"  Computing edge descriptors for {n} images...")
+        descriptors = np.array(
+            [compute_edge_descriptor(edge_maps[fn]) for fn in filenames]
+        )
+        print(f"  Computing cosine distance matrix...")
+        dist_matrix = cdist(descriptors, descriptors, metric="cosine")
 
-    print(f"  Computing cosine distance matrix...")
-    # cosine distance: fast even for n=2000 (2000x128 matrix)
-    dist_matrix = cdist(descriptors, descriptors, metric="cosine")
+    elif distance_metric == "embedding":
+        if image_folder is None:
+            raise ValueError("image_folder required for embedding distance metric")
+        embeddings = compute_image_features(filenames, image_folder)
+        print(f"  Computing cosine distance matrix from CLIP embeddings...")
+        dist_matrix = cdist(embeddings, embeddings, metric="cosine")
+
+    elif distance_metric == "combined":
+        if image_folder is None:
+            raise ValueError("image_folder required for combined distance metric")
+        # Edge descriptors
+        print(f"  Computing edge descriptors for {n} images...")
+        edge_descs = np.array(
+            [compute_edge_descriptor(edge_maps[fn]) for fn in filenames]
+        )
+        edge_dist = cdist(edge_descs, edge_descs, metric="cosine")
+
+        # CLIP embeddings
+        embeddings = compute_image_features(filenames, image_folder)
+        embed_dist = cdist(embeddings, embeddings, metric="cosine")
+
+        # Normalize both to [0, 1] range before combining
+        edge_max = edge_dist.max()
+        embed_max = embed_dist.max()
+        if edge_max > 0:
+            edge_dist_norm = edge_dist / edge_max
+        else:
+            edge_dist_norm = edge_dist
+        if embed_max > 0:
+            embed_dist_norm = embed_dist / embed_max
+        else:
+            embed_dist_norm = embed_dist
+
+        w = EMBEDDING_WEIGHT
+        dist_matrix = (1 - w) * edge_dist_norm + w * embed_dist_norm
+        print(f"  Combined distance matrix: {1-w:.0%} edge + {w:.0%} semantic")
+
+    else:
+        raise ValueError(f"Unknown distance_metric: {distance_metric}")
 
     # For each image, find K nearest (excluding self)
     neighbors = {}
@@ -267,7 +409,9 @@ def _compute_pair(args):
     return i, j, cost, pos_a, pos_b, ts
 
 
-def build_sparse_cost_matrix(edge_maps, max_workers=None, k=K_NEIGHBORS):
+def build_sparse_cost_matrix(
+    edge_maps, max_workers=None, k=K_NEIGHBORS, image_folder=None
+):
     """
     1. Build KNN shortlist using cheap descriptors.
     2. Run expensive tile matching only on shortlisted pairs.
@@ -277,8 +421,9 @@ def build_sparse_cost_matrix(edge_maps, max_workers=None, k=K_NEIGHBORS):
         filenames, cost_matrix, tile_info
     """
     filenames, shortlisted_pairs, neighbors, coarse_dist = build_knn_shortlist(
-        edge_maps, k=k
+        edge_maps, k=k, image_folder=image_folder
     )
+    _unload_clip_model()
     n = len(filenames)
     cost_matrix = np.full((n, n), inf)
     tile_info = {}
@@ -293,7 +438,13 @@ def build_sparse_cost_matrix(edge_maps, max_workers=None, k=K_NEIGHBORS):
     print(f"  Tile-matching {total} shortlisted pairs (of {n*(n-1)//2} total)...")
 
     done = 0
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+    if max_workers is None:
+        max_workers = min(os.cpu_count() or 1, 8)
+
+    # Use ThreadPoolExecutor instead of ProcessPoolExecutor to avoid
+    # fork() memory duplication. NumPy releases the GIL so threads
+    # still get good parallelism for the heavy array operations.
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_compute_pair, t): t for t in tasks}
         for future in as_completed(futures):
             i, j, cost, pos_a, pos_b, ts = future.result()
@@ -636,7 +787,7 @@ def sequence(
         if set(filenames) != set(edge_maps.keys()):
             print("  Cache stale — recomputing.")
             filenames, cost_matrix, tile_info = build_sparse_cost_matrix(
-                edge_maps, max_workers=max_workers
+                edge_maps, max_workers=max_workers, image_folder=image_folder
             )
             with open(cache_file, "wb") as f:
                 pickle.dump(
@@ -650,7 +801,7 @@ def sequence(
     else:
         print("Step 2/4: Computing sparse pairwise costs (KNN + tile matching)...")
         filenames, cost_matrix, tile_info = build_sparse_cost_matrix(
-            edge_maps, max_workers=max_workers
+            edge_maps, max_workers=max_workers, image_folder=image_folder
         )
         with open(cache_file, "wb") as f:
             pickle.dump(
