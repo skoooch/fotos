@@ -775,12 +775,14 @@ def generate_vid(
         ts_ld = int(min(ld_h, ld_w) * tile_ratio)
         ts_actual = int(ts_ld * scale)
 
+        # Clamp tile size to image dimensions (square crop)
+        ts_actual = min(ts_actual, actual_h, actual_w)
+
+        # Clamp position so the full square tile fits within the image
         sy = max(0, min(int(tile_y * scale), actual_h - ts_actual))
         sx = max(0, min(int(tile_x * scale), actual_w - ts_actual))
-        sh = min(ts_actual, actual_h - sy)
-        sw = min(ts_actual, actual_w - sx)
 
-        crop = img[sy : sy + sh, sx : sx + sw]
+        crop = img[sy : sy + ts_actual, sx : sx + ts_actual]
         if crop.size == 0:
             continue
         frames.append(crop)
