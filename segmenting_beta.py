@@ -157,7 +157,7 @@ def load_seggpt_model_local(model_name, ckpt_path, device):
 
 def load_seggpt_model_huggingface(device):
     """Load SegGPT model from HuggingFace Transformers."""
-    model_id = "BAAI/seggpt-vit-large"
+    model_id = "BAAI/seggpt-vit-small"
     processor = SegGptImageProcessor.from_pretrained(model_id)
     model = SegGptForImageSegmentation.from_pretrained(model_id)
     model.eval()
@@ -208,10 +208,19 @@ def inference_seggpt_huggingface(
     model, processor, device, input_image, prompt_image, prompt_mask
 ):
     """Run SegGPT inference using the HuggingFace Transformers model."""
+    # Convert prompt_mask to a numpy array with explicit shape to avoid
+    # the processor misinterpreting dimensions. The processor expects
+    # prompt_masks as a list (one per input image), where each element
+    # is a list of masks (one per prompt). We use numpy arrays to prevent
+    # the internal make_list_of_images from adding extra dimensions.
+    prompt_mask_np = np.array(prompt_mask, dtype=np.uint8)  # (H, W, 3)
+    prompt_image_np = np.array(prompt_image, dtype=np.uint8)  # (H, W, 3)
+    input_image_np = np.array(input_image, dtype=np.uint8)  # (H, W, 3)
+
     inputs = processor(
-        images=input_image,
-        prompt_images=prompt_image,
-        prompt_masks=prompt_mask,
+        images=input_image_np,
+        prompt_images=prompt_image_np,
+        prompt_masks=prompt_mask_np,
         return_tensors="pt",
     )
     inputs = {k: v.to(device) for k, v in inputs.items()}
@@ -307,6 +316,8 @@ def generate_default_prompt(input_image_path):
 
     # Convert to 3-channel RGB PIL image so HuggingFace processor handles it correctly
     mask_rgb = np.stack([mask, mask, mask], axis=-1)
+    # Ensure the array is contiguous with the correct shape before creating the PIL image
+    mask_rgb = np.ascontiguousarray(mask_rgb, dtype=np.uint8)
     mask_pil = Image.fromarray(mask_rgb, mode="RGB")
 
     return img_resized, mask_pil
@@ -350,11 +361,18 @@ def main():
         print("Loading SegGPT model from HuggingFace...")
         model, processor = load_seggpt_model_huggingface(device)
 
-        input_image = Image.open(args.input_image).convert("RGB")
+        input_image_original = Image.open(args.input_image).convert("RGB")
+        input_image = input_image_original.resize(
+            (SEG_GPT_IMAGE_SIZE, SEG_GPT_IMAGE_SIZE), Image.LANCZOS
+        )
 
         if has_prompt:
-            prompt_image = Image.open(args.prompt_image).convert("RGB")
-            prompt_mask = Image.open(args.prompt_mask).convert("RGB")
+            prompt_image = Image.open(args.prompt_image).convert("RGB").resize(
+                (SEG_GPT_IMAGE_SIZE, SEG_GPT_IMAGE_SIZE), Image.LANCZOS
+            )
+            prompt_mask = Image.open(args.prompt_mask).convert("RGB").resize(
+                (SEG_GPT_IMAGE_SIZE, SEG_GPT_IMAGE_SIZE), Image.NEAREST
+            )
         else:
             print("No prompt provided. Using auto-generated saliency-based prompt.")
             prompt_image, prompt_mask = generate_default_prompt(args.input_image)

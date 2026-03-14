@@ -23,8 +23,8 @@ from scipy.spatial.distance import cdist
 
 
 # ── Config ──────────────────────────────────────────────────────────────────
-TILE_RATIO = 0.45
-STRIDE = 40
+TILE_RATIO = 0.5
+STRIDE = 20
 EDGE_BLUR_KSIZE = 3
 NUM_2OPT_ITERATIONS = 50
 K_NEIGHBORS = 15  # only tile-match the K most promising neighbors per image
@@ -299,8 +299,9 @@ def build_sparse_cost_matrix(edge_maps, max_workers=None, k=K_NEIGHBORS):
             tile_info[(i, j)] = (pos_a, pos_b, ts)
             tile_info[(j, i)] = (pos_b, pos_a, ts)
             done += 1
-            if done % 50 == 0 or done == total:
-                print(f"    {done}/{total}")
+            if done % 10 == 0 or done == total:
+                with open("tile_matching.log", "a") as log:
+                    log.write(f"{done}/{total}\n")
 
     # Fill remaining entries with scaled coarse distance as fallback
     # This ensures the TSP solver can still traverse non-shortlisted edges

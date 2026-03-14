@@ -3,5 +3,5 @@ Pillow
 transformers
 torch
 svgwrite
-open-cv
+opencv-python
 scipy
