@@ -299,13 +299,17 @@ def generate_default_prompt(input_image_path):
     # Color-difference saliency
     mean_color = img_np.mean(axis=(0, 1))
     color_diff = np.sqrt(np.sum((img_np - mean_color) ** 2, axis=-1))
-    color_diff /= color_diff.max()
+    color_diff /= color_diff.max() + 1e-8
 
     # Combine and threshold
     saliency = center_prior * 0.5 + color_diff * 0.5
     mask = (saliency > np.percentile(saliency, 60)).astype(np.uint8) * 255
 
-    return img_resized, Image.fromarray(mask)
+    # Convert to 3-channel RGB PIL image so HuggingFace processor handles it correctly
+    mask_rgb = np.stack([mask, mask, mask], axis=-1)
+    mask_pil = Image.fromarray(mask_rgb, mode="RGB")
+
+    return img_resized, mask_pil
 
 
 # ---- Saving Results ----
@@ -353,8 +357,7 @@ def main():
             prompt_mask = Image.open(args.prompt_mask).convert("RGB")
         else:
             print("No prompt provided. Using auto-generated saliency-based prompt.")
-            prompt_image, prompt_mask_gray = generate_default_prompt(args.input_image)
-            prompt_mask = prompt_mask_gray.convert("RGB")
+            prompt_image, prompt_mask = generate_default_prompt(args.input_image)
 
         print("Running SegGPT inference (HuggingFace)...")
         prediction = inference_seggpt_huggingface(
