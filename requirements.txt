@@ -1,2 +1,7 @@
+numpy
 Pillow
-opencv-python
+transformers
+torch
+svgwrite
+open-cv
+scipy
