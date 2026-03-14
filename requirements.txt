@@ -5,3 +5,4 @@ torch
 svgwrite
 opencv-python
 scipy
+open_clip_torch
