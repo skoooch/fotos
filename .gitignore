@@ -8,6 +8,8 @@
 *.yml
 !cusco_salkantay_med/*
 MLVcode/__pycache__*
+__pycache__/*
+*.pkl
 MLVcode/.DS_Store*
 !smallVecLDs.mat
 .venv/*
