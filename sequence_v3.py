@@ -23,7 +23,7 @@ from scipy.spatial.distance import cdist
 
 
 # ── Config ──────────────────────────────────────────────────────────────────
-TILE_RATIO = 0.5
+TILE_RATIO = 0.75
 STRIDE = 25
 EDGE_BLUR_KSIZE = 3
 NUM_2OPT_ITERATIONS = 50
@@ -31,9 +31,9 @@ K_NEIGHBORS = 15  # only tile-match the K most promising neighbors per image
 TARGET_SHORT_EDGE = 512
 EDGE_THRESHOLD = 0.1
 MIN_EDGE_DENSITY = 0.01
-REFINE_STRIDE = 3       # fine-grained stride for tile refinement
-REFINE_RADIUS = 2   # search radius (pixels) around current tile position
-REFINE_ITERATIONS = 3   # number of forward+backward sweeps
+REFINE_STRIDE = 8       # fine-grained stride for tile refinement
+REFINE_RADIUS = 25   # search radius (pixels) around current tile position
+REFINE_ITERATIONS = 10   # number of forward+backward sweeps
 
 
 # ── Edge Extraction ─────────────────────────────────────────────────────────
@@ -766,14 +766,19 @@ def generate_vid(
             continue
 
         actual_h, actual_w = img.shape[:2]
-        scale_y = actual_h / ld_h
-        scale_x = actual_w / ld_w
-        ts_ld = int(min(ld_h, ld_w) * tile_ratio)
 
-        sy = max(0, min(int(tile_y * scale_y), actual_h - int(ts_ld * scale_y)))
-        sx = max(0, min(int(tile_x * scale_x), actual_w - int(ts_ld * scale_x)))
-        sh = min(int(ts_ld * scale_y), actual_h - sy)
-        sw = min(int(ts_ld * scale_x), actual_w - sx)
+        # Use a uniform scale so rotated images don't get stretched.
+        # The edge map was produced by scaling the short edge to TARGET_SHORT_EDGE,
+        # so recover that same scale factor uniformly.
+        scale = min(actual_h, actual_w) / min(ld_h, ld_w)
+
+        ts_ld = int(min(ld_h, ld_w) * tile_ratio)
+        ts_actual = int(ts_ld * scale)
+
+        sy = max(0, min(int(tile_y * scale), actual_h - ts_actual))
+        sx = max(0, min(int(tile_x * scale), actual_w - ts_actual))
+        sh = min(ts_actual, actual_h - sy)
+        sw = min(ts_actual, actual_w - sx)
 
         crop = img[sy : sy + sh, sx : sx + sw]
         if crop.size == 0:
