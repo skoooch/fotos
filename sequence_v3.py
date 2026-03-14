@@ -31,9 +31,9 @@ K_NEIGHBORS = 15  # only tile-match the K most promising neighbors per image
 TARGET_SHORT_EDGE = 512
 EDGE_THRESHOLD = 0.1
 MIN_EDGE_DENSITY = 0.01
-REFINE_STRIDE = 8       # fine-grained stride for tile refinement
-REFINE_RADIUS = 25   # search radius (pixels) around current tile position
-REFINE_ITERATIONS = 10   # number of forward+backward sweeps
+REFINE_STRIDE = 8  # fine-grained stride for tile refinement
+REFINE_RADIUS = 25  # search radius (pixels) around current tile position
+REFINE_ITERATIONS = 10  # number of forward+backward sweeps
 
 
 # ── Edge Extraction ─────────────────────────────────────────────────────────
@@ -509,7 +509,7 @@ def refine_tile_positions(
 
         for k in sweep_order:
             with open("tile_matching.log", "a") as log:
-                    log.write(f"{iteration - k}\n")
+                log.write(f"{iteration - k}\n")
             idx = path[k]
             fn = filenames[idx]
             em = edge_maps[fn]
@@ -698,9 +698,7 @@ def sequence(
     print(f"  Final cost:  {final_cost:.2f}\n")
 
     print("Step 5: Fine-grained tile position refinement...")
-    refined_positions = refine_tile_positions(
-        path, filenames, edge_maps, tile_info
-    )
+    refined_positions = refine_tile_positions(path, filenames, edge_maps, tile_info)
     print()
 
     with open(output_file, "w") as f:
@@ -724,7 +722,7 @@ def generate_vid(
     sequence_file,
     foto_folder,
     output_path="output_v3.mp4",
-    fps=8,
+    fps=15,
     tile_ratio=TILE_RATIO,
 ):
     entries = []
