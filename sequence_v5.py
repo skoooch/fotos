@@ -4,7 +4,8 @@ Sequence images by finding smooth contour-based transitions.
 Strategy:
   1. Compute weighted edge maps (not binary) preserving edge strength.
   2. Cheap global descriptors to build a K-nearest-neighbor shortlist.
-  3. Expensive tile matching on ALL tile-pair combinations for shortlisted pairs.
+  3. Expensive tile matching on ALL tile-pair combinations for shortlisted pairs,
+     testing multiple tile sizes (ratios from T_R_MIN to T_R_MAX).
   4. Build a sparse cost graph with tile-position-aware TSP solver.
   5. Store tile positions for video generation.
 
@@ -32,13 +33,16 @@ from PIL import Image
 
 # ── Config ──────────────────────────────────────────────────────────────────
 TILE_RATIO = 0.75
+T_R_MAX = 1
+T_R_MIN = 0.6
+T_R_STRIDE = 0.1
 STRIDE = 50  # coarser stride for expanded tile-pair search
 EDGE_BLUR_KSIZE = 3
 EDGE_GAMMA = 1.5  # >1 suppresses weak edges, amplifies strong ones
 MIN_EDGE_LENGTH = 30  # minimum connected-component size in pixels to keep
-EDGE_THRESHOLD_LOW = 0.25  # discard edge pixels below this strength
+EDGE_THRESHOLD_LOW = 0.6  # discard edge pixels below this strength
 NUM_2OPT_ITERATIONS = 50
-K_NEIGHBORS = 15  # only tile-match the K most promising neighbors per image
+K_NEIGHBORS = 30  # only tile-match the K most promising neighbors per image
 TARGET_SHORT_EDGE = 512
 EDGE_THRESHOLD = 0.1
 MIN_EDGE_DENSITY = 0.01
@@ -48,6 +52,18 @@ REFINE_ITERATIONS = 4  # number of forward+backward sweeps
 DISTANCE_METRIC = "embedding"  # "edge_descript", "embedding", or "combined"
 EMBEDDING_WEIGHT = 0.5  # weight for embedding distance in combined mode
 EDGE_METHOD = "hed"  # "hed", "scharr"
+
+# ── Derived: list of tile ratios to test ─────────────────────────────────────
+TILE_RATIOS = []
+_r = T_R_MIN
+while _r <= T_R_MAX + 1e-9:
+    TILE_RATIOS.append(round(_r, 6))
+    _r += T_R_STRIDE
+TILE_RATIOS = sorted(set(TILE_RATIOS))
+
+# Common comparison size: the tile pixel size produced by the smallest ratio
+# on a given image. We resize all tiles to this common size before Chamfer.
+# This is computed per-pair as: int(min(h_a, w_a, h_b, w_b) * T_R_MIN)
 
 # ── HED Model ───────────────────────────────────────────────────────────────
 
@@ -415,9 +431,11 @@ def compute_edge_descriptor(edge_map, num_spatial_bins=4, num_orient_bins=8):
 
 # ── Tile Position Utilities ─────────────────────────────────────────────────
 
+# A tile position is now a tuple (y, x, tile_size) to support variable sizes.
+
 
 def _tile_positions(h, w, tile_size, stride=STRIDE):
-    """Return list of (y, x) tile top-left positions for an image."""
+    """Return list of (y, x) tile top-left positions for an image at a given tile_size."""
     positions = []
     for y in range(0, h - tile_size + 1, stride):
         for x in range(0, w - tile_size + 1, stride):
@@ -427,14 +445,51 @@ def _tile_positions(h, w, tile_size, stride=STRIDE):
     return positions
 
 
-def _precompute_tile_data(edge_map, positions, tile_size, threshold=EDGE_THRESHOLD):
+def _tile_positions_multi(h, w, tile_ratios=TILE_RATIOS, stride=STRIDE):
     """
-    Precompute mask, weights, distance transform for each tile position.
-    Returns list of (y, x, mask, weights, sum_w, dt) for valid tiles.
+    Return list of (y, x, tile_size) positions for ALL tile ratios.
+    """
+    positions = []
+    for ratio in tile_ratios:
+        tile_size = int(min(h, w) * ratio)
+        if tile_size < 16 or tile_size > h or tile_size > w:
+            continue
+        for y in range(0, h - tile_size + 1, stride):
+            for x in range(0, w - tile_size + 1, stride):
+                positions.append((y, x, tile_size))
+        # Ensure at least one position for this ratio
+        if not any(p[2] == tile_size for p in positions):
+            positions.append((0, 0, tile_size))
+    if not positions:
+        # Absolute fallback
+        ts = int(min(h, w) * TILE_RATIOS[0])
+        ts = max(16, min(ts, h, w))
+        positions.append(((h - ts) // 2, (w - ts) // 2, ts))
+    return positions
+
+
+def _precompute_tile_data_multi(
+    edge_map, positions_with_size, common_size, threshold=EDGE_THRESHOLD
+):
+    """
+    Precompute mask, weights, distance transform for each tile position,
+    resizing all tiles to `common_size` for comparable Chamfer distances.
+
+    positions_with_size: list of (y, x, tile_size)
+    common_size: int — all tiles are resized to (common_size, common_size)
+
+    Returns list of (y, x, tile_size, mask, weights, sum_w, dt) for valid tiles.
     """
     tiles = []
-    for y, x in positions:
-        tile = edge_map[y : y + tile_size, x : x + tile_size]
+    for y, x, ts in positions_with_size:
+        tile = edge_map[y : y + ts, x : x + ts]
+        if tile.shape[0] != ts or tile.shape[1] != ts:
+            continue
+        # Resize to common comparison size
+        if ts != common_size:
+            tile = cv.resize(
+                tile, (common_size, common_size), interpolation=cv.INTER_AREA
+            )
         mask = tile > threshold
         if mask.mean() < MIN_EDGE_DENSITY:
             continue
@@ -443,85 +498,98 @@ def _precompute_tile_data(edge_map, positions, tile_size, threshold=EDGE_THRESHO
         if sum_w == 0:
             continue
         dt = distance_transform_edt(~mask)
-        tiles.append((y, x, mask, weights, sum_w, dt))
+        tiles.append((y, x, ts, mask, weights, sum_w, dt))
     return tiles
 
 
-def get_tile_positions_for_image(edge_map, tile_ratio=TILE_RATIO, stride=STRIDE):
-    """Return the list of valid tile positions for a single image."""
+def get_tile_positions_for_image(edge_map, tile_ratios=TILE_RATIOS, stride=STRIDE):
+    """
+    Return the list of valid tile positions for a single image across all
+    tile ratios.
+
+    Returns:
+        valid: list of (y, x, tile_size) tuples
+    """
     h, w = edge_map.shape
-    tile_size = int(min(h, w) * tile_ratio)
-    if tile_size < 16:
-        return [], tile_size
-    positions = _tile_positions(h, w, tile_size, stride)
-    # Filter to positions that have enough edges
+    all_positions = _tile_positions_multi(h, w, tile_ratios, stride)
+
     valid = []
-    for y, x in positions:
-        tile = edge_map[y : y + tile_size, x : x + tile_size]
+    for y, x, ts in all_positions:
+        tile = edge_map[y : y + ts, x : x + ts]
+        if tile.shape[0] != ts or tile.shape[1] != ts:
+            continue
         mask = tile > EDGE_THRESHOLD
         if mask.mean() >= MIN_EDGE_DENSITY and tile[mask].sum() > 0:
-            valid.append((y, x))
+            valid.append((y, x, ts))
+
     if not valid:
-        # Fallback to center
-        valid.append(((h - tile_size) // 2, (w - tile_size) // 2))
-    return valid, tile_size
+        # Fallback to center at smallest ratio
+        ts = int(min(h, w) * tile_ratios[0])
+        ts = max(16, min(ts, h, w))
+        valid.append(((h - ts) // 2, (w - ts) // 2, ts))
+
+    return valid
 
 
 # ── All Tile-Pair Cost Computation ──────────────────────────────────────────
 
 
-def find_all_tile_pair_costs(edge_a, edge_b, tile_ratio=TILE_RATIO, stride=STRIDE):
+def find_all_tile_pair_costs(edge_a, edge_b, tile_ratios=TILE_RATIOS, stride=STRIDE):
     """
     Compute Chamfer cost for ALL valid tile position combinations between
-    two images.
+    two images, across ALL tile ratios.
+
+    Tiles of different sizes are resized to a common comparison size
+    (the smallest tile size across both images) before computing Chamfer distance.
 
     Returns:
-        costs: dict mapping ((ay, ax), (by, bx)) -> cost
+        costs: dict mapping ((ay, ax, a_ts), (by, bx, b_ts)) -> cost
         best_cost: float (minimum cost across all pairs)
-        best_pos_a: (y, x) of best tile in image a
-        best_pos_b: (y, x) of best tile in image b
-        tile_size: int
+        best_pos_a: (y, x, tile_size) of best tile in image a
+        best_pos_b: (y, x, tile_size) of best tile in image b
     """
     h_a, w_a = edge_a.shape
     h_b, w_b = edge_b.shape
-    tile_size = int(min(h_a, w_a, h_b, w_b) * tile_ratio)
 
-    if tile_size < 16:
-        return {}, inf, (0, 0), (0, 0), tile_size
+    # Common comparison size: smallest tile across all ratios and both images
+    min_dim = min(h_a, w_a, h_b, w_b)
+    common_size = int(min_dim * min(tile_ratios))
+    if common_size < 16:
+        common_size = 16
 
-    positions_a = _tile_positions(h_a, w_a, tile_size, stride)
-    positions_b = _tile_positions(h_b, w_b, tile_size, stride)
+    positions_a = _tile_positions_multi(h_a, w_a, tile_ratios, stride)
+    positions_b = _tile_positions_multi(h_b, w_b, tile_ratios, stride)
 
-    tiles_a = _precompute_tile_data(edge_a, positions_a, tile_size)
-    tiles_b = _precompute_tile_data(edge_b, positions_b, tile_size)
+    tiles_a = _precompute_tile_data_multi(edge_a, positions_a, common_size)
+    tiles_b = _precompute_tile_data_multi(edge_b, positions_b, common_size)
 
     if not tiles_a or not tiles_b:
-        return {}, inf, (0, 0), (0, 0), tile_size
+        return {}, inf, None, None
 
     costs = {}
     best_cost = inf
-    best_pos_a = (tiles_a[0][0], tiles_a[0][1])
-    best_pos_b = (tiles_b[0][0], tiles_b[0][1])
+    best_pos_a = (tiles_a[0][0], tiles_a[0][1], tiles_a[0][2])
+    best_pos_b = (tiles_b[0][0], tiles_b[0][1], tiles_b[0][2])
 
-    for ay, ax, mask_a, weights_a, sum_wa, dt_a in tiles_a:
-        for by, bx, mask_b, weights_b, sum_wb, dt_b in tiles_b:
+    for ay, ax, a_ts, mask_a, weights_a, sum_wa, dt_a in tiles_a:
+        for by, bx, b_ts, mask_b, weights_b, sum_wb, dt_b in tiles_b:
             d_ab = np.sum(weights_a * dt_b[mask_a]) / sum_wa
             d_ba = np.sum(weights_b * dt_a[mask_b]) / sum_wb
             cost = (d_ab + d_ba) / 2.0
-            costs[((ay, ax), (by, bx))] = cost
+            costs[((ay, ax, a_ts), (by, bx, b_ts))] = cost
             if cost < best_cost:
                 best_cost = cost
-                best_pos_a = (ay, ax)
-                best_pos_b = (by, bx)
+                best_pos_a = (ay, ax, a_ts)
+                best_pos_b = (by, bx, b_ts)
 
-    return costs, best_cost, best_pos_a, best_pos_b, tile_size
+    return costs, best_cost, best_pos_a, best_pos_b
 
 
 def _compute_all_pairs(args):
     """Worker for parallel all-tile-pair matching."""
     i, j, edge_i, edge_j = args
-    costs, best_cost, pos_a, pos_b, ts = find_all_tile_pair_costs(edge_i, edge_j)
-    return i, j, costs, best_cost, pos_a, pos_b, ts
+    costs, best_cost, pos_a, pos_b = find_all_tile_pair_costs(edge_i, edge_j)
+    return i, j, costs, best_cost, pos_a, pos_b
 
 
 # ── Pairwise Cost Matrix (Sparse, KNN-based) ───────────────────────────────
@@ -630,16 +698,15 @@ def build_sparse_cost_data(
 ):
     """
     1. Build KNN shortlist using cheap descriptors.
-    2. Run expensive ALL tile-pair matching on shortlisted pairs.
+    2. Run expensive ALL tile-pair matching on shortlisted pairs (multi-ratio).
     3. Compute fallback costs for non-shortlisted pairs.
 
     Returns:
         filenames: list of filenames
-        all_pair_costs: dict (i,j) -> {((ay,ax),(by,bx)): cost, ...}
+        all_pair_costs: dict (i,j) -> {((ay,ax,a_ts),(by,bx,b_ts)): cost, ...}
                         where i < j, keyed as canonical (min,max) pairs
         best_costs: dict (i,j) -> float, best cost per pair (for fallback matrix)
-        tile_positions_per_image: dict idx -> list of (y,x) valid positions
-        tile_sizes: dict (i,j) -> int
+        tile_positions_per_image: dict idx -> list of (y,x,tile_size) valid positions
         fallback_cost_matrix: n×n array with coarse costs for non-shortlisted
         coarse_dist: n×n raw coarse distance matrix
     """
@@ -649,17 +716,14 @@ def build_sparse_cost_data(
     _unload_clip_model()
     n = len(filenames)
 
-    all_pair_costs = {}  # (i,j) -> {((ay,ax),(by,bx)): cost}
+    all_pair_costs = {}  # (i,j) -> {((ay,ax,a_ts),(by,bx,b_ts)): cost}
     best_costs = {}  # (i,j) -> float
-    tile_sizes = {}  # (i,j) -> int
 
-    # Precompute tile positions per image
+    # Precompute tile positions per image (multi-ratio)
     tile_positions_per_image = {}
-    tile_size_per_image = {}
     for idx, fn in enumerate(filenames):
-        positions, ts = get_tile_positions_for_image(edge_maps[fn])
+        positions = get_tile_positions_for_image(edge_maps[fn])
         tile_positions_per_image[idx] = positions
-        tile_size_per_image[idx] = ts
 
     # Prepare tasks for shortlisted pairs
     tasks = [
@@ -671,6 +735,7 @@ def build_sparse_cost_data(
     print(
         f"  All-tile-pair matching {total} shortlisted pairs (of {n*(n-1)//2} total)..."
     )
+    print(f"  Tile ratios: {TILE_RATIOS}")
     print(
         f"  Avg tile positions per image: {np.mean([len(v) for v in tile_positions_per_image.values()]):.1f}"
     )
@@ -682,11 +747,10 @@ def build_sparse_cost_data(
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_compute_all_pairs, t): t for t in tasks}
         for future in as_completed(futures):
-            i, j, costs, best_cost, pos_a, pos_b, ts = future.result()
+            i, j, costs, best_cost, pos_a, pos_b = future.result()
             key = (min(i, j), max(i, j))
             all_pair_costs[key] = costs
             best_costs[key] = best_cost
-            tile_sizes[key] = ts
             done += 1
             if done % 10 == 0 or done == total:
                 with open("tile_matching.log", "a") as log:
@@ -695,7 +759,6 @@ def build_sparse_cost_data(
                     print(f"    {done}/{total} pairs computed")
 
     # Build fallback cost matrix for non-shortlisted pairs
-    # Use best_costs for shortlisted, scaled coarse distance for others
     best_cost_matrix = np.full((n, n), inf)
     for (i, j), cost in best_costs.items():
         best_cost_matrix[i, j] = cost
@@ -731,7 +794,6 @@ def build_sparse_cost_data(
         all_pair_costs,
         best_costs,
         tile_positions_per_image,
-        tile_sizes,
         fallback_cost_matrix,
         coarse_dist,
     )
@@ -739,11 +801,15 @@ def build_sparse_cost_data(
 
 # ── Tile-Aware Cost Lookup ──────────────────────────────────────────────────
 
+# Tile positions are now (y, x, tile_size) tuples throughout.
+
 
 def lookup_cost(i, j, pos_i, pos_j, all_pair_costs, fallback_cost_matrix):
     """
     Look up the cost of transitioning from image i (at tile pos_i) to
     image j (at tile pos_j).
+
+    pos_i and pos_j are (y, x, tile_size) tuples or None.
 
     If the pair was shortlisted, we have exact tile-pair costs.
     Otherwise, fall back to coarse cost.
@@ -779,12 +845,12 @@ def best_cost_for_arrival(
     i, j, pos_i, all_pair_costs, fallback_cost_matrix, tile_positions_j
 ):
     """
-    Given that image i is locked at pos_i, find the best tile position for
-    image j and the corresponding cost.
+    Given that image i is locked at pos_i (y, x, tile_size), find the best
+    tile position for image j and the corresponding cost.
 
     Returns:
         best_cost: float
-        best_pos_j: (y, x) or None
+        best_pos_j: (y, x, tile_size) or None
     """
     key = (min(i, j), max(i, j))
     pair_costs = all_pair_costs.get(key)
@@ -819,8 +885,8 @@ def best_cost_any_pos(i, j, all_pair_costs, fallback_cost_matrix):
 
     Returns:
         best_cost: float
-        best_pos_i: (y, x) or None
-        best_pos_j: (y, x) or None
+        best_pos_i: (y, x, tile_size) or None
+        best_pos_j: (y, x, tile_size) or None
     """
     key = (min(i, j), max(i, j))
     pair_costs = all_pair_costs.get(key)
@@ -849,6 +915,7 @@ def greedy_nearest_neighbor_tileaware(
 ):
     """
     Nearest-neighbor heuristic that tracks each image's current tile position.
+    Tile positions are (y, x, tile_size) tuples.
 
     When we move from image `current` to `next`:
       - If `current` already has a locked tile position, we find the best
@@ -859,7 +926,7 @@ def greedy_nearest_neighbor_tileaware(
     Returns:
         best_path: list of image indices
         best_total: float total cost
-        best_positions: dict image_idx -> (ty, tx)
+        best_positions: dict image_idx -> (ty, tx, tile_size)
     """
     best_path = None
     best_total = inf
@@ -875,7 +942,7 @@ def greedy_nearest_neighbor_tileaware(
         path = [start]
         total = 0.0
         current = start
-        cur_positions = {}  # image_idx -> (ty, tx)
+        cur_positions = {}  # image_idx -> (ty, tx, tile_size)
 
         for _ in range(n - 1):
             best_nxt = None
@@ -1113,7 +1180,6 @@ def two_opt_tileaware(
                     candidate_positions = dict(best_positions)
 
                     # Re-optimize tile positions at the boundary nodes
-                    # The reversal changes neighbors for nodes at positions i-1, i, j, j+1
                     boundary_indices = set()
                     if i - 1 >= 0:
                         boundary_indices.add(i - 1)
@@ -1183,11 +1249,21 @@ def two_opt_tileaware(
 # ── Tile Position Refinement ────────────────────────────────────────────────
 
 
-def _chamfer_cost(tile_a, tile_b, threshold=EDGE_THRESHOLD):
+def _chamfer_cost_common(tile_a, tile_b, common_size, threshold=EDGE_THRESHOLD):
     """
-    Compute symmetric weighted Chamfer distance between two edge tiles.
-    Both inputs should be same-sized float32 edge-strength maps.
+    Compute symmetric weighted Chamfer distance between two edge tiles,
+    resizing both to common_size first.
+    Both inputs should be float32 edge-strength maps (possibly different sizes).
     """
+    if tile_a.shape[0] != common_size or tile_a.shape[1] != common_size:
+        tile_a = cv.resize(
+            tile_a, (common_size, common_size), interpolation=cv.INTER_AREA
+        )
+    if tile_b.shape[0] != common_size or tile_b.shape[1] != common_size:
+        tile_b = cv.resize(
+            tile_b, (common_size, common_size), interpolation=cv.INTER_AREA
+        )
+
     mask_a = tile_a > threshold
     mask_b = tile_b > threshold
 
@@ -1212,7 +1288,7 @@ def refine_tile_positions(
     filenames,
     edge_maps,
     tile_positions,
-    tile_ratio=TILE_RATIO,
+    tile_ratios=TILE_RATIOS,
     refine_stride=REFINE_STRIDE,
     refine_radius=REFINE_RADIUS,
     num_iterations=REFINE_ITERATIONS,
@@ -1223,18 +1299,28 @@ def refine_tile_positions(
 
     This uses a much finer stride than the initial tile matching, since
     we only search a small neighborhood around the current position and
-    only consider adjacent pairs.
+    only consider adjacent pairs. Searches across all tile ratios.
 
     Args:
         path: sequence of image indices
         filenames: list of filenames
         edge_maps: dict fn -> edge map
-        tile_positions: dict image_idx -> (ty, tx) from the tile-aware solver
+        tile_positions: dict image_idx -> (ty, tx, tile_size) from the tile-aware solver
 
     Returns:
         refined_positions: list of (tile_y, tile_x, tile_size) per sequence index
     """
     n = len(path)
+
+    # Compute common comparison size across all images in the path
+    min_dim = inf
+    for idx in path:
+        fn = filenames[idx]
+        em = edge_maps[fn]
+        h, w = em.shape
+        min_dim = min(min_dim, h, w)
+    common_size = int(min_dim * min(tile_ratios))
+    common_size = max(16, common_size)
 
     # Initialize positions from tile-aware solver results
     positions = []  # (ty, tx, ts) for each index in path order
@@ -1242,12 +1328,15 @@ def refine_tile_positions(
         fn = filenames[idx]
         em = edge_maps[fn]
         h, w = em.shape
-        ts = int(min(h, w) * tile_ratio)
 
         pos = tile_positions.get(idx)
         if pos is not None:
-            ty, tx = pos
+            ty, tx, ts = pos
         else:
+            # Default to center at middle ratio
+            mid_ratio = tile_ratios[len(tile_ratios) // 2]
+            ts = int(min(h, w) * mid_ratio)
+            ts = max(16, min(ts, h, w))
             ty, tx = (h - ts) // 2, (w - ts) // 2
 
         # Clamp
@@ -1269,8 +1358,8 @@ def refine_tile_positions(
         for k in range(n - 1):
             t_a = get_tile(k)
             t_b = get_tile(k + 1)
-            if t_a.shape == t_b.shape and t_a.size > 0:
-                total += _chamfer_cost(t_a, t_b)
+            if t_a.size > 0 and t_b.size > 0:
+                total += _chamfer_cost_common(t_a, t_b, common_size)
         return total
 
     initial_cost = compute_total_cost()
@@ -1289,7 +1378,7 @@ def refine_tile_positions(
             fn = filenames[idx]
             em = edge_maps[fn]
             h, w = em.shape
-            cur_ty, cur_tx, ts = positions[k]
+            cur_ty, cur_tx, cur_ts = positions[k]
 
             # Determine which neighbors to consider
             neighbors = []
@@ -1303,63 +1392,79 @@ def refine_tile_positions(
 
             neighbor_tiles = [get_tile(nk) for nk in neighbors]
 
-            # Search window around current position
-            y_min = max(0, cur_ty - refine_radius)
-            y_max = min(h - ts, cur_ty + refine_radius)
-            x_min = max(0, cur_tx - refine_radius)
-            x_max = min(w - ts, cur_tx + refine_radius)
-
-            if y_max < y_min or x_max < x_min:
-                continue
-
             best_cost = inf
-            best_pos = (cur_ty, cur_tx)
+            best_pos = (cur_ty, cur_tx, cur_ts)
 
             # Evaluate current position first
-            cur_tile = em[cur_ty : cur_ty + ts, cur_tx : cur_tx + ts]
-            if cur_tile.shape[0] == ts and cur_tile.shape[1] == ts:
+            cur_tile = em[cur_ty : cur_ty + cur_ts, cur_tx : cur_tx + cur_ts]
+            if cur_tile.shape[0] == cur_ts and cur_tile.shape[1] == cur_ts:
                 cur_cost = 0.0
                 valid = True
                 for nt in neighbor_tiles:
-                    if nt.shape == cur_tile.shape:
-                        cur_cost += _chamfer_cost(cur_tile, nt)
+                    if nt.size > 0:
+                        cur_cost += _chamfer_cost_common(cur_tile, nt, common_size)
                     else:
                         valid = False
                         break
                 if valid:
                     best_cost = cur_cost
-                    best_pos = (cur_ty, cur_tx)
+                    best_pos = (cur_ty, cur_tx, cur_ts)
 
-            # Search the neighborhood
-            for ty in range(y_min, y_max + 1, refine_stride):
-                for tx in range(x_min, x_max + 1, refine_stride):
-                    if ty == cur_ty and tx == cur_tx:
-                        continue
+            # Search the neighborhood across all tile ratios
+            for ratio in tile_ratios:
+                ts = int(min(h, w) * ratio)
+                if ts < 16 or ts > h or ts > w:
+                    continue
 
-                    candidate = em[ty : ty + ts, tx : tx + ts]
-                    if candidate.shape[0] != ts or candidate.shape[1] != ts:
-                        continue
+                # Scale refine_radius relative to the tile size ratio
+                # so we search proportionally
+                if cur_ts > 0:
+                    scale_factor = ts / cur_ts
+                else:
+                    scale_factor = 1.0
+                scaled_radius = max(1, int(refine_radius * scale_factor))
 
-                    cost = 0.0
-                    skip = False
-                    for nt in neighbor_tiles:
-                        if nt.shape != candidate.shape:
-                            skip = True
-                            break
-                        c = _chamfer_cost(candidate, nt)
-                        cost += c
-                        if cost >= best_cost:
-                            skip = True
-                            break
-                    if skip:
-                        continue
+                # Center of search: scale current position to this tile size
+                center_ty = max(0, min(int(cur_ty * scale_factor), h - ts))
+                center_tx = max(0, min(int(cur_tx * scale_factor), w - ts))
 
-                    if cost < best_cost:
-                        best_cost = cost
-                        best_pos = (ty, tx)
+                y_min = max(0, center_ty - scaled_radius)
+                y_max = min(h - ts, center_ty + scaled_radius)
+                x_min = max(0, center_tx - scaled_radius)
+                x_max = min(w - ts, center_tx + scaled_radius)
 
-            if best_pos != (cur_ty, cur_tx):
-                positions[k] = (best_pos[0], best_pos[1], ts)
+                if y_max < y_min or x_max < x_min:
+                    continue
+
+                for ty in range(y_min, y_max + 1, refine_stride):
+                    for tx in range(x_min, x_max + 1, refine_stride):
+                        if ty == cur_ty and tx == cur_tx and ts == cur_ts:
+                            continue
+
+                        candidate = em[ty : ty + ts, tx : tx + ts]
+                        if candidate.shape[0] != ts or candidate.shape[1] != ts:
+                            continue
+
+                        cost = 0.0
+                        skip = False
+                        for nt in neighbor_tiles:
+                            if nt.size == 0:
+                                skip = True
+                                break
+                            c = _chamfer_cost_common(candidate, nt, common_size)
+                            cost += c
+                            if cost >= best_cost:
+                                skip = True
+                                break
+                        if skip:
+                            continue
+
+                        if cost < best_cost:
+                            best_cost = cost
+                            best_pos = (ty, tx, ts)
+
+            if best_pos != (cur_ty, cur_tx, cur_ts):
+                positions[k] = best_pos
                 changed = True
 
         new_cost = compute_total_cost()
@@ -1399,6 +1504,8 @@ def sequence(
         print("Need at least 2 images.")
         return
 
+    print(f"  Tile ratios: {TILE_RATIOS}")
+
     if os.path.exists(cache_file):
         print("Step 2/5: Loading cached cost data...")
         with open(cache_file, "rb") as f:
@@ -1415,7 +1522,6 @@ def sequence(
                 all_pair_costs,
                 best_costs,
                 tile_positions_per_image,
-                tile_sizes,
                 fallback_cost_matrix,
                 coarse_dist,
             ) = build_sparse_cost_data(
@@ -1438,7 +1544,6 @@ def sequence(
             all_pair_costs,
             best_costs,
             tile_positions_per_image,
-            tile_sizes,
             fallback_cost_matrix,
             coarse_dist,
         ) = build_sparse_cost_data(
@@ -1495,7 +1600,7 @@ def sequence(
             em = edge_maps[fn]
             h, w = em.shape
             ty, tx, ts = refined_positions[k]
-            f.write(f"{fn},{ty},{tx},{h},{w}\n")
+            f.write(f"{fn},{ty},{tx},{ts},{h},{w}\n")
 
     print(f"Sequence written to {output_file}")
     print("Order:")
@@ -1511,7 +1616,6 @@ def generate_vid(
     foto_folder,
     output_path="output_v4.mp4",
     fps=15,
-    tile_ratio=TILE_RATIO,
 ):
     entries = []
     with open(sequence_file, "r") as f:
@@ -1522,15 +1626,16 @@ def generate_vid(
             parts = line.split(",")
             fn = parts[0]
             tile_y, tile_x = int(parts[1]), int(parts[2])
-            ld_h, ld_w = int(parts[3]), int(parts[4])
-            entries.append((fn, tile_y, tile_x, ld_h, ld_w))
+            tile_size_ld = int(parts[3])
+            ld_h, ld_w = int(parts[4]), int(parts[5])
+            entries.append((fn, tile_y, tile_x, tile_size_ld, ld_h, ld_w))
 
     if not entries:
         print("No entries in sequence file.")
         return
 
     frames = []
-    for fn, tile_y, tile_x, ld_h, ld_w in entries:
+    for fn, tile_y, tile_x, tile_size_ld, ld_h, ld_w in entries:
         base = os.path.splitext(fn)[0]
         foto_path = None
         for ext in (".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG", ".tif", ".bmp"):
@@ -1555,9 +1660,7 @@ def generate_vid(
 
         scale = min(actual_h, actual_w) / min(ld_h, ld_w)
 
-        ts_ld = int(min(ld_h, ld_w) * tile_ratio)
-        ts_actual = int(ts_ld * scale)
-
+        ts_actual = int(tile_size_ld * scale)
         ts_actual = min(ts_actual, actual_h, actual_w)
 
         sy = max(0, min(int(tile_y * scale), actual_h - ts_actual))
@@ -1572,12 +1675,17 @@ def generate_vid(
         print("No frames.")
         return
 
-    out_h, out_w = frames[0].shape[:2]
+    # Use the smallest frame size as output size for consistency
+    out_h = min(f.shape[0] for f in frames)
+    out_w = min(f.shape[1] for f in frames)
+    # Make square based on the minimum dimension
+    out_size = min(out_h, out_w)
+
     writer = cv.VideoWriter(
-        output_path, cv.VideoWriter_fourcc(*"mp4v"), fps, (out_w, out_h)
+        output_path, cv.VideoWriter_fourcc(*"mp4v"), fps, (out_size, out_size)
     )
     for frame in frames:
-        writer.write(cv.resize(frame, (out_w, out_h)))
+        writer.write(cv.resize(frame, (out_size, out_size)))
     writer.release()
     print(f"Video saved: {output_path} ({len(frames)} frames @ {fps}fps)")
 
