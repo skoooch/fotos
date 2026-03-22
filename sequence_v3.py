@@ -30,13 +30,13 @@ TILE_RATIO = 0.75
 STRIDE = 25
 EDGE_BLUR_KSIZE = 3
 NUM_2OPT_ITERATIONS = 50
-K_NEIGHBORS = 30  # only tile-match the K most promising neighbors per image
+K_NEIGHBORS = 15  # only tile-match the K most promising neighbors per image
 TARGET_SHORT_EDGE = 512
 EDGE_THRESHOLD = 0.1
 MIN_EDGE_DENSITY = 0.01
-REFINE_STRIDE = 8  # fine-grained stride for tile refinement
+REFINE_STRIDE = 5  # fine-grained stride for tile refinement
 REFINE_RADIUS = 25  # search radius (pixels) around current tile position
-REFINE_ITERATIONS = 10  # number of forward+backward sweeps
+REFINE_ITERATIONS = 2  # number of forward+backward sweeps
 DISTANCE_METRIC = "embedding"  # "edge_descript", "embedding", or "combined"
 EMBEDDING_WEIGHT = 0.5  # weight for embedding distance in combined mode
 
@@ -483,7 +483,9 @@ def build_sparse_cost_matrix(
 
 
 # ── TSP Solver: Greedy + 2-opt ─────────────────────────────────────────────
-
+# Should really have our cost matrix include all tiling pairs. I think rn
+# say it went from im11->im2 where im2 tile was top left, if the best possible link
+# out of im2 was with im2 tile in the bottom right it would still choose this
 
 def greedy_nearest_neighbor(cost_matrix):
     """Nearest-neighbor heuristic, trying all start nodes."""
@@ -767,6 +769,7 @@ def sequence(
     output_file="sequence_order_v3.txt",
     cache_file="cost_matrix_cache.pkl",
     max_workers=None,
+    cache_prefix=""
 ):
     print("Step 1/4: Building edge maps...")
     edge_maps = build_edge_maps(image_folder)
@@ -959,4 +962,5 @@ if __name__ == "__main__":
     else:
         image_folder = sys.argv[1] if len(sys.argv) > 1 else "."
         workers = int(sys.argv[2]) if len(sys.argv) > 2 else None
+        d = sys.argv[3] if len(sys.argv) > 3 else ""
         sequence(image_folder, max_workers=workers)

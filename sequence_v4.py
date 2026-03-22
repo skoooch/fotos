@@ -1337,10 +1337,43 @@ def generate_vid(
     writer.release()
     print(f"Video saved: {output_path} ({len(frames)} frames @ {fps}fps)")
 
-
+def save_some_edges():
+    """Save edge maps for the first 10 images as PNGs for manual inspection."""
+    image_folder = sys.argv[1] if len(sys.argv) > 1 else "."
+    edge_maps = build_edge_maps(image_folder)
+    
+    output_dir = os.path.join(image_folder, "edge_previews")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    filenames = sorted(edge_maps.keys())[:10]
+    for fn in filenames:
+        edge_map = edge_maps[fn]
+        # Convert float32 [0,1] edge map to uint8 [0,255] for saving
+        edge_img = (edge_map * 255).astype(np.uint8)
+        
+        # Also save a thresholded binary version for clarity
+        _, binary = cv.threshold(edge_img, int(EDGE_THRESHOLD * 255), 255, cv.THRESH_BINARY)
+        
+        base = os.path.splitext(fn)[0]
+        cv.imwrite(os.path.join(output_dir, f"{base}_edges.png"), edge_img)
+        cv.imwrite(os.path.join(output_dir, f"{base}_edges_binary.png"), binary)
+        
+        # Also save the tile crop that would actually be compared
+        h, w = edge_map.shape
+        ts = int(min(h, w) * TILE_RATIO)
+        cy, cx = (h - ts) // 2, (w - ts) // 2
+        tile = edge_map[cy:cy + ts, cx:cx + ts]
+        tile_img = (tile * 255).astype(np.uint8)
+        cv.imwrite(os.path.join(output_dir, f"{base}_tile.png"), tile_img)
+        
+        print(f"  Saved edge previews for {fn}")
+    
+    print(f"Edge previews saved to {output_dir}")
 # ── CLI ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    save_some_edges()
+    exit()
     if len(sys.argv) > 1 and sys.argv[1] == "video":
         foto_folder = sys.argv[2] if len(sys.argv) > 2 else "."
         generate_vid("sequence_order_v3.txt", foto_folder)
