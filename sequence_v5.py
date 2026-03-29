@@ -1549,16 +1549,16 @@ def sequence(
         ) = build_sparse_cost_data(
             edge_maps, max_workers=max_workers, image_folder=image_folder
         )
-        with open(cache_file, "wb") as f:
-            pickle.dump(
-                {
-                    "filenames": filenames,
-                    "all_pair_costs": all_pair_costs,
-                    "tile_positions_per_image": tile_positions_per_image,
-                    "fallback_cost_matrix": fallback_cost_matrix,
-                },
-                f,
-            )
+        # with open(cache_file, "wb") as f:
+        #     pickle.dump(
+        #         {
+        #             "filenames": filenames,
+        #             "all_pair_costs": all_pair_costs,
+        #             "tile_positions_per_image": tile_positions_per_image,
+        #             "fallback_cost_matrix": fallback_cost_matrix,
+        #         },
+        #         f,
+        #     )
     print()
 
     print("Step 3/5: Tile-aware greedy nearest-neighbor path...")
