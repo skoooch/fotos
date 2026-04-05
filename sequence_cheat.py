@@ -3,15 +3,14 @@ Sequence images using a video transformer for next-frame prediction.
 
 Strategy:
   1. Compute CLIP embeddings for all images to build a KNN shortlist.
-  2. Compute edge maps for tile extraction.
-  3. Greedily build a sequence:
+  2. Greedily build a sequence:
      a. Start with 1 image (best connected by CLIP similarity).
      b. For each step, consider the K=30 most similar unvisited images.
      c. For each candidate image, evaluate multiple tile positions/sizes.
      d. Use a video transformer to score how well each candidate tile
         continues the existing sequence (lower perplexity = better fit).
      e. Pick the best (image, tile) and append to the sequence.
-  4. Output sequence file compatible with generate_vid().
+  3. Output sequence file compatible with generate_vid().
 
 Requires ~32GB VRAM for the video model.
 """
@@ -42,13 +41,6 @@ MAX_CONTEXT_FRAMES = 12  # max prior frames to feed as context to the video mode
 TILE_CANDIDATES_PER_IMAGE = 20  # max tile positions to evaluate per candidate image
 FRAME_SIZE = 480  # video model input resolution
 BATCH_EVAL_SIZE = 4  # how many candidates to evaluate in parallel
-EDGE_THRESHOLD = 0.1
-MIN_EDGE_DENSITY = 0.01
-EDGE_BLUR_KSIZE = 3
-EDGE_GAMMA = 1.5
-EDGE_THRESHOLD_LOW = 0.6
-MIN_EDGE_LENGTH = 30
-EDGE_METHOD = "hed"
 
 # Tile ratios
 TILE_RATIOS = []
@@ -58,138 +50,6 @@ while _r <= T_R_MAX + 1e-9:
     _r += T_R_STRIDE
 TILE_RATIOS = sorted(set(TILE_RATIOS))
 
-# ── HED Model ───────────────────────────────────────────────────────────────
-
-_hed_net = None
-_hed_crop_registered = False
-HED_MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
-HED_PROTOTXT_URL = (
-    "https://raw.githubusercontent.com/s9xie/hed/master/examples/hed/deploy.prototxt"
-)
-HED_CAFFEMODEL_URL = "https://vcl.ucsd.edu/hed/hed_pretrained_bsds.caffemodel"
-
-
-def _download_file(url, dest):
-    import urllib.request
-
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
-    print(f"    Downloading {os.path.basename(dest)}...")
-    urllib.request.urlretrieve(url, dest)
-    print(f"    Saved to {dest}")
-
-
-def _get_hed_model():
-    global _hed_net, _hed_crop_registered
-    if _hed_net is not None:
-        return _hed_net
-
-    prototxt_path = os.path.join(HED_MODEL_DIR, "deploy.prototxt")
-    caffemodel_path = os.path.join(HED_MODEL_DIR, "hed_pretrained_bsds.caffemodel")
-
-    if not os.path.exists(prototxt_path):
-        _download_file(HED_PROTOTXT_URL, prototxt_path)
-    if not os.path.exists(caffemodel_path):
-        _download_file(HED_CAFFEMODEL_URL, caffemodel_path)
-
-    if not _hed_crop_registered:
-
-        class CropLayer:
-            def __init__(self, params, blobs):
-                self.startX = 0
-                self.startY = 0
-
-            def getMemoryShapes(self, inputs):
-                (inputShape, targetShape) = (inputs[0], inputs[1])
-                batchSize, numChannels = inputShape[0], inputShape[1]
-                height, width = targetShape[2], targetShape[3]
-                self.startY = (inputShape[2] - targetShape[2]) // 2
-                self.startX = (inputShape[3] - targetShape[3]) // 2
-                return [[batchSize, numChannels, height, width]]
-
-            def forward(self, inputs):
-                return [
-                    inputs[0][
-                        :,
-                        :,
-                        self.startY : self.startY + inputs[1].shape[2],
-                        self.startX : self.startX + inputs[1].shape[3],
-                    ]
-                ]
-
-        cv.dnn_registerLayer("Crop", CropLayer)
-        _hed_crop_registered = True
-
-    print("  Loading HED model...")
-    _hed_net = cv.dnn.readNetFromCaffe(prototxt_path, caffemodel_path)
-    if cv.cuda.getCudaEnabledDeviceCount() > 0:
-        try:
-            _hed_net.setPreferableBackend(cv.dnn.DNN_BACKEND_CUDA)
-            _hed_net.setPreferableTarget(cv.dnn.DNN_TARGET_CUDA)
-        except Exception:
-            pass
-    print("  HED model loaded.")
-    return _hed_net
-
-
-def _hed_edge_map(img_bgr, target_short_edge=TARGET_SHORT_EDGE):
-    h, w = img_bgr.shape[:2]
-    scale = target_short_edge / min(h, w)
-    new_w, new_h = int(w * scale), int(h * scale)
-    img_resized = cv.resize(img_bgr, (new_w, new_h), interpolation=cv.INTER_AREA)
-    net = _get_hed_model()
-    blob = cv.dnn.blobFromImage(
-        img_resized,
-        scalefactor=1.0,
-        size=(new_w, new_h),
-        mean=(104.00698793, 116.66876762, 122.67891434),
-        swapRB=False,
-        crop=False,
-    )
-    net.setInput(blob)
-    out = net.forward()
-    edge_map = out[0, 0]
-    return np.clip(edge_map, 0, 1).astype(np.float32)
-
-
-def get_weighted_edges(image_path, target_short_edge=TARGET_SHORT_EDGE):
-    if EDGE_METHOD == "hed":
-        img_bgr = cv.imread(image_path)
-        if img_bgr is None:
-            raise FileNotFoundError(f"Cannot read {image_path}")
-        magnitude = _hed_edge_map(img_bgr, target_short_edge)
-    else:
-        img = cv.imread(image_path, cv.IMREAD_GRAYSCALE)
-        if img is None:
-            raise FileNotFoundError(f"Cannot read {image_path}")
-        h, w = img.shape
-        scale = target_short_edge / min(h, w)
-        img = cv.resize(
-            img, (int(w * scale), int(h * scale)), interpolation=cv.INTER_AREA
-        )
-        img = cv.GaussianBlur(img, (EDGE_BLUR_KSIZE, EDGE_BLUR_KSIZE), 0)
-        grad_x = cv.Scharr(img, cv.CV_64F, 1, 0)
-        grad_y = cv.Scharr(img, cv.CV_64F, 0, 1)
-        magnitude = np.sqrt(grad_x**2 + grad_y**2)
-        mag_max = magnitude.max()
-        if mag_max > 0:
-            magnitude /= mag_max
-        magnitude = magnitude.astype(np.float32)
-
-    magnitude[magnitude < EDGE_THRESHOLD_LOW] = 0.0
-    edge_binary = (magnitude > 0).astype(np.uint8)
-    num_labels, labels = cv.connectedComponents(edge_binary, connectivity=8)
-    component_sizes = np.bincount(labels.ravel())
-    small_labels = np.where(component_sizes < MIN_EDGE_LENGTH)[0]
-    keep_mask = np.ones(num_labels, dtype=bool)
-    keep_mask[0] = False
-    keep_mask[small_labels] = False
-    magnitude = magnitude * keep_mask[labels]
-    mag_max = magnitude.max()
-    if mag_max > 0:
-        magnitude /= mag_max
-    magnitude = np.power(magnitude, EDGE_GAMMA)
-    return magnitude.astype(np.float32)
-
 
 # ── CLIP Embeddings ─────────────────────────────────────────────────────────
 
@@ -197,6 +57,18 @@ def get_weighted_edges(image_path, target_short_edge=TARGET_SHORT_EDGE):
 def compute_clip_embeddings(filenames, image_folder):
     """Compute L2-normalized CLIP embeddings for all images."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Test CUDA actually works before committing
+    if device == "cuda":
+        try:
+            test = torch.randn(1, 3, 16, 16, device=device)
+            _ = F.conv2d(test, torch.randn(1, 3, 3, 3, device=device), padding=1)
+            del test, _
+            torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"  CUDA test failed ({e}), falling back to CPU for CLIP")
+            device = "cpu"
+
     print(f"  Loading CLIP model on {device}...")
     model, _, preprocess = open_clip.create_model_and_transforms(
         "ViT-B-32", pretrained="laion2b_s34b_b79k"
@@ -243,29 +115,52 @@ def compute_clip_embeddings(filenames, image_folder):
     return embeddings
 
 
-# ── Tile Extraction ─────────────────────────────────────────────────────────
+# ── Image Loading & Tile Extraction ─────────────────────────────────────────
 
 
-def get_valid_tile_positions(edge_map, tile_ratios=TILE_RATIOS, stride=STRIDE):
-    """Return list of (y, x, tile_size) valid tile positions for an image."""
-    h, w = edge_map.shape
+def load_image_dimensions(
+    image_folder, extensions=(".jpg", ".jpeg", ".png", ".tif", ".bmp")
+):
+    """Load filenames and their dimensions (at the working scale)."""
+    image_info = {}  # fn -> (scaled_h, scaled_w)
+    for fn in sorted(os.listdir(image_folder)):
+        if os.path.splitext(fn)[1].lower() in extensions:
+            path = os.path.join(image_folder, fn)
+            try:
+                img = cv.imread(path)
+                if img is None:
+                    continue
+                h, w = img.shape[:2]
+                scale = TARGET_SHORT_EDGE / min(h, w)
+                scaled_h, scaled_w = int(h * scale), int(w * scale)
+                image_info[fn] = (scaled_h, scaled_w)
+                print(
+                    f"  loaded: {fn}  original=({h},{w})  scaled=({scaled_h},{scaled_w})"
+                )
+            except Exception as e:
+                print(f"  SKIP {fn}: {e}")
+    return image_info
+
+
+def get_valid_tile_positions(
+    scaled_h, scaled_w, tile_ratios=TILE_RATIOS, stride=STRIDE
+):
+    """
+    Return list of (y, x, tile_size) valid tile positions for an image,
+    based only on geometry (no edge map needed).
+    """
     positions = []
     for ratio in tile_ratios:
-        ts = int(min(h, w) * ratio)
-        if ts < 16 or ts > h or ts > w:
+        ts = int(min(scaled_h, scaled_w) * ratio)
+        if ts < 16 or ts > scaled_h or ts > scaled_w:
             continue
-        for y in range(0, h - ts + 1, stride):
-            for x in range(0, w - ts + 1, stride):
-                tile = edge_map[y : y + ts, x : x + ts]
-                if tile.shape[0] != ts or tile.shape[1] != ts:
-                    continue
-                mask = tile > EDGE_THRESHOLD
-                if mask.mean() >= MIN_EDGE_DENSITY and tile[mask].sum() > 0:
-                    positions.append((y, x, ts))
+        for y in range(0, scaled_h - ts + 1, stride):
+            for x in range(0, scaled_w - ts + 1, stride):
+                positions.append((y, x, ts))
     if not positions:
-        ts = int(min(h, w) * tile_ratios[0])
-        ts = max(16, min(ts, h, w))
-        positions.append(((h - ts) // 2, (w - ts) // 2, ts))
+        ts = int(min(scaled_h, scaled_w) * tile_ratios[0])
+        ts = max(16, min(ts, scaled_h, scaled_w))
+        positions.append(((scaled_h - ts) // 2, (scaled_w - ts) // 2, ts))
     return positions
 
 
@@ -276,15 +171,21 @@ def extract_tile_rgb(image_path, ty, tx, ts, output_size=FRAME_SIZE):
         return None
     actual_h, actual_w = img.shape[:2]
 
-    # Edge maps are computed at TARGET_SHORT_EDGE scale; map back to original
-    edge_scale = TARGET_SHORT_EDGE / min(actual_h, actual_w)
-    inv_scale = 1.0 / edge_scale
+    # Tile coords are in TARGET_SHORT_EDGE scale; map back to original
+    scale = TARGET_SHORT_EDGE / min(actual_h, actual_w)
+    inv_scale = 1.0 / scale
 
-    sy = max(0, min(int(ty * inv_scale), actual_h - int(ts * inv_scale)))
-    sx = max(0, min(int(tx * inv_scale), actual_w - int(ts * inv_scale)))
-    sts = max(16, min(int(ts * inv_scale), actual_h - sy, actual_w - sx))
+    # Map tile coordinates to original image space
+    orig_ts = int(ts * inv_scale)
+    orig_ty = int(ty * inv_scale)
+    orig_tx = int(tx * inv_scale)
 
-    crop = img[sy : sy + sts, sx : sx + sts]
+    # Clamp to image bounds
+    orig_ts = max(16, min(orig_ts, actual_h, actual_w))
+    orig_ty = max(0, min(orig_ty, actual_h - orig_ts))
+    orig_tx = max(0, min(orig_tx, actual_w - orig_ts))
+
+    crop = img[orig_ty : orig_ty + orig_ts, orig_tx : orig_tx + orig_ts]
     if crop.size == 0:
         return None
 
@@ -336,14 +237,11 @@ class VideoTransformerScorer:
     Uses a video generation/prediction model to score how well a candidate
     frame continues an existing sequence.
 
-    We use CogVideoX-2b (a relatively compact video transformer that fits
-    in ~20-24GB VRAM with fp16) to compute a pseudo-likelihood score.
+    Uses CogVideoX-2b (~20-24GB VRAM with fp16) to compute a pseudo-likelihood.
 
     The approach:
-      - Encode the context frames as a video clip.
-      - For each candidate next frame, compute how well the model "predicts"
-        it given the context by measuring reconstruction loss (MSE in latent
-        space after encoding the full sequence including the candidate).
+      - Encode the context frames + candidate as a video clip.
+      - Measure reconstruction loss in latent space.
       - Lower reconstruction loss = better continuation.
     """
 
@@ -365,10 +263,7 @@ class VideoTransformerScorer:
 
         try:
             from diffusers import CogVideoXPipeline
-            from diffusers.models import AutoencoderKLCogVideoX
 
-            # Load just the VAE for encoding frames into latent space
-            # The VAE's reconstruction quality tells us about frame coherence
             self.pipe = CogVideoXPipeline.from_pretrained(
                 self.model_name,
                 torch_dtype=torch.float16,
@@ -384,7 +279,6 @@ class VideoTransformerScorer:
 
             self.scheduler = self.pipe.scheduler
 
-            # Free the full pipeline to save memory
             self.text_encoder = self.pipe.text_encoder.to(self.device)
             self.text_encoder.eval()
             self.tokenizer = self.pipe.tokenizer
@@ -402,7 +296,7 @@ class VideoTransformerScorer:
             self._load_vae_only()
 
     def _load_vae_only(self):
-        """Fallback: use a video-aware VAE or image VAE for scoring."""
+        """Fallback: use video-aware VAE for scoring."""
         try:
             from diffusers.models import AutoencoderKLCogVideoX
 
@@ -418,54 +312,39 @@ class VideoTransformerScorer:
             print("  VAE-only scorer loaded.")
         except Exception as e2:
             print(f"  VAE fallback also failed: {e2}")
-            print("  Will use perceptual (LPIPS-like) scoring instead.")
+            print("  Will use perceptual scoring instead.")
             self._loaded = True
             self.vae = None
             self.transformer = None
 
     def unload(self):
         """Free all model memory."""
-        if self.vae is not None:
-            del self.vae
-            self.vae = None
-        if self.transformer is not None:
-            del self.transformer
-            self.transformer = None
-        if hasattr(self, "text_encoder") and self.text_encoder is not None:
-            del self.text_encoder
-            self.text_encoder = None
-        if self.pipe is not None:
-            del self.pipe
-            self.pipe = None
+        for attr in ("vae", "transformer", "text_encoder", "pipe"):
+            if hasattr(self, attr) and getattr(self, attr) is not None:
+                delattr(self, attr)
+                setattr(self, attr, None)
         self._loaded = False
         torch.cuda.empty_cache()
         gc.collect()
 
     def _frames_to_tensor(self, frames, size=FRAME_SIZE):
         """
-        Convert list of numpy RGB frames (H, W, 3) uint8 to a batched
-        video tensor of shape (B, C, T, H, W) normalized to [-1, 1].
+        Convert list of numpy RGB frames (H, W, 3) uint8 to
+        video tensor (B=1, C, T, H, W) normalized to [-1, 1].
         """
         tensors = []
         for f in frames:
             if f.shape[0] != size or f.shape[1] != size:
                 f = cv.resize(f, (size, size), interpolation=cv.INTER_AREA)
-            t = torch.from_numpy(f).float().permute(2, 0, 1) / 127.5 - 1.0
+            t = torch.from_numpy(f.copy()).float().permute(2, 0, 1) / 127.5 - 1.0
             tensors.append(t)
-        # (T, C, H, W)
-        video = torch.stack(tensors, dim=0)
-        # (B=1, C, T, H, W)
-        video = video.permute(1, 0, 2, 3).unsqueeze(0)
-        # CogVideoX VAE expects (B, C, T, H, W)
+        video = torch.stack(tensors, dim=0)  # (T, C, H, W)
+        video = video.permute(1, 0, 2, 3).unsqueeze(0)  # (1, C, T, H, W)
         return video.to(self.device, dtype=torch.float16)
 
     def score_candidates(self, context_frames, candidate_frames):
         """
         Score how well each candidate frame continues the context sequence.
-
-        Args:
-            context_frames: list of numpy RGB frames (the sequence so far)
-            candidate_frames: list of numpy RGB frames (one per candidate)
 
         Returns:
             scores: list of float, lower = better continuation
@@ -474,7 +353,6 @@ class VideoTransformerScorer:
             self.load()
 
         if self.vae is None and self.transformer is None:
-            # Perceptual fallback: just use pixel-space temporal smoothness
             return self._score_perceptual(context_frames, candidate_frames)
 
         if self.transformer is not None:
@@ -484,22 +362,10 @@ class VideoTransformerScorer:
 
     @torch.no_grad()
     def _score_with_transformer(self, context_frames, candidate_frames):
-        """
-        Score using the full transformer. We encode context + candidate into
-        latent space, run a single denoising step, and measure how close the
-        model's prediction is to the actual latent — lower error means the
-        model "expects" this frame given the context.
-        """
+        """Score using the full transformer via single-step denoising."""
         scores = []
 
-        # Encode context frames once
-        if len(context_frames) > 0:
-            ctx_tensor = self._frames_to_tensor(context_frames)
-            ctx_latent = self.vae.encode(ctx_tensor).latent_dist.mean
-        else:
-            ctx_latent = None
-
-        # Get a null text embedding for unconditional scoring
+        # Null text embedding for unconditional scoring
         null_tokens = self.tokenizer(
             "",
             padding="max_length",
@@ -512,75 +378,51 @@ class VideoTransformerScorer:
 
         for i in range(0, len(candidate_frames), BATCH_EVAL_SIZE):
             batch = candidate_frames[i : i + BATCH_EVAL_SIZE]
-            batch_scores = []
 
             for cand_frame in batch:
-                # Build full sequence: context + candidate
                 full_seq = context_frames[-MAX_CONTEXT_FRAMES:] + [cand_frame]
                 full_tensor = self._frames_to_tensor(full_seq)
 
-                # Encode to latent space
-                full_latent = self.vae.encode(full_tensor).latent_dist.mean
-
-                # Add a small amount of noise and try to denoise
-                # The reconstruction quality indicates temporal coherence
-                noise = torch.randn_like(full_latent) * 0.1
-                noisy_latent = full_latent + noise
-
-                # Use scheduler to set up a single step
-                self.scheduler.set_timesteps(50)
-                t = self.scheduler.timesteps[45]  # mild noise level
-                timesteps = torch.tensor([t], device=self.device).long()
-
-                # Forward through transformer
                 try:
+                    full_latent = self.vae.encode(full_tensor).latent_dist.mean
+
+                    noise = torch.randn_like(full_latent) * 0.1
+                    noisy_latent = full_latent + noise
+
+                    self.scheduler.set_timesteps(50)
+                    t = self.scheduler.timesteps[45]
+                    timesteps = torch.tensor([t], device=self.device).long()
+
                     model_output = self.transformer(
                         hidden_states=noisy_latent,
                         timestep=timesteps,
                         encoder_hidden_states=null_embeds,
                     )
-                    if hasattr(model_output, "sample"):
-                        predicted = model_output.sample
-                    else:
-                        predicted = model_output[0]
+                    predicted = (
+                        model_output.sample
+                        if hasattr(model_output, "sample")
+                        else model_output[0]
+                    )
 
-                    # Score: how well does the model reconstruct the sequence?
-                    # Focus on the last frame (the candidate)
                     recon_error = F.mse_loss(
                         predicted[:, :, -1:], full_latent[:, :, -1:]
                     ).item()
-                    batch_scores.append(recon_error)
+                    scores.append(recon_error)
                 except Exception as e:
                     print(f"    Transformer scoring failed: {e}, using VAE fallback")
-                    batch_scores.append(
-                        self._score_single_vae(context_frames, cand_frame)
-                    )
-
-            scores.extend(batch_scores)
+                    scores.append(self._score_single_vae(context_frames, cand_frame))
 
         return scores
 
     @torch.no_grad()
     def _score_with_vae(self, context_frames, candidate_frames):
-        """
-        VAE-only scoring: encode context + candidate as a video clip,
-        decode, and measure reconstruction error. The VAE's temporal
-        compression means temporally coherent sequences reconstruct better.
-        """
-        scores = []
-
-        for cand_frame in candidate_frames:
-            scores.append(self._score_single_vae(context_frames, cand_frame))
-
-        return scores
+        """VAE-only scoring via temporal reconstruction error."""
+        return [self._score_single_vae(context_frames, cf) for cf in candidate_frames]
 
     @torch.no_grad()
     def _score_single_vae(self, context_frames, cand_frame):
         """Score a single candidate using VAE reconstruction."""
         full_seq = context_frames[-MAX_CONTEXT_FRAMES:] + [cand_frame]
-
-        # CogVideoX VAE needs at least a few frames
-        # Pad if necessary
         while len(full_seq) < 2:
             full_seq = [full_seq[0]] + full_seq
 
@@ -590,13 +432,10 @@ class VideoTransformerScorer:
             latent = self.vae.encode(full_tensor).latent_dist.mean
             recon = self.vae.decode(latent).sample
 
-            # Reconstruction error on the last frame
             orig_last = full_tensor[:, :, -1:]
             recon_last = recon[:, :, -1:]
             error = F.mse_loss(recon_last, orig_last).item()
 
-            # Also measure temporal consistency: difference between
-            # reconstruction of last two frames
             if recon.shape[2] >= 2:
                 temporal_diff = F.mse_loss(
                     recon[:, :, -1:] - recon[:, :, -2:-1],
@@ -617,20 +456,18 @@ class VideoTransformerScorer:
 
     def _score_perceptual_single(self, context_frames, cand_frame):
         """
-        Simple perceptual scoring: weighted combination of
-        color histogram continuity + edge structure similarity.
+        Simple perceptual scoring: color histogram continuity +
+        edge structure similarity + motion smoothness.
         """
         if not context_frames:
             return 0.0
 
         last_frame = context_frames[-1]
-
-        # Resize both to common size
         size = 256
         a = cv.resize(last_frame, (size, size))
         b = cv.resize(cand_frame, (size, size))
 
-        # Color histogram distance (per channel)
+        # Color histogram distance
         hist_dist = 0.0
         for ch in range(3):
             h_a = cv.calcHist([a], [ch], None, [64], [0, 256])
@@ -640,7 +477,7 @@ class VideoTransformerScorer:
             hist_dist += cv.compareHist(h_a, h_b, cv.HISTCMP_BHATTACHARYYA)
         hist_dist /= 3.0
 
-        # Structural similarity via edge comparison
+        # Edge structure similarity
         gray_a = cv.cvtColor(a, cv.COLOR_RGB2GRAY)
         gray_b = cv.cvtColor(b, cv.COLOR_RGB2GRAY)
         edges_a = cv.Canny(gray_a, 50, 150).astype(np.float32)
@@ -651,47 +488,26 @@ class VideoTransformerScorer:
             edges_b /= edges_b.max()
         edge_dist = np.mean((edges_a - edges_b) ** 2)
 
-        # Pixel MSE (gentle weight)
+        # Pixel MSE
         pixel_dist = np.mean((a.astype(np.float32) - b.astype(np.float32)) ** 2) / (
             255.0**2
         )
 
-        # Multi-frame smoothness bonus: if we have 2+ context frames, penalize
-        # abrupt changes in the motion direction
+        # Motion smoothness penalty
         motion_penalty = 0.0
         if len(context_frames) >= 2:
             prev_frame = context_frames[-2]
             p = cv.resize(prev_frame, (size, size)).astype(np.float32)
             a_f = a.astype(np.float32)
             b_f = b.astype(np.float32)
-            # "velocity" of previous transition
             vel_prev = a_f - p
-            # "velocity" of candidate transition
             vel_next = b_f - a_f
-            # Acceleration (change in velocity) — should be small for smooth motion
             accel = np.mean((vel_next - vel_prev) ** 2) / (255.0**2)
             motion_penalty = accel * 0.5
 
-        score = (
+        return (
             0.3 * hist_dist + 0.3 * edge_dist + 0.2 * pixel_dist + 0.2 * motion_penalty
         )
-        return score
-
-
-# ── Edge Map Building ───────────────────────────────────────────────────────
-
-
-def build_edge_maps(image_folder, extensions=(".jpg", ".jpeg", ".png", ".tif", ".bmp")):
-    edge_maps = {}
-    for fn in sorted(os.listdir(image_folder)):
-        if os.path.splitext(fn)[1].lower() in extensions:
-            path = os.path.join(image_folder, fn)
-            try:
-                edge_maps[fn] = get_weighted_edges(path)
-                print(f"  edges: {fn}  shape={edge_maps[fn].shape}")
-            except Exception as e:
-                print(f"  SKIP {fn}: {e}")
-    return edge_maps
 
 
 # ── Main Sequencing Pipeline ────────────────────────────────────────────────
@@ -712,27 +528,15 @@ def sequence_with_video_transformer(
     """
     Greedily build an image sequence using a video transformer to score
     candidate next frames.
-
-    Pipeline:
-      1. Load images, compute edge maps and CLIP embeddings.
-      2. Build KNN graph from CLIP embeddings.
-      3. Load video transformer.
-      4. Greedy loop:
-         a. Get K nearest unvisited neighbors of current image.
-         b. For each neighbor, sample tile positions.
-         c. Extract tile crops at full resolution.
-         d. Score each (neighbor, tile) combo with the video transformer.
-         e. Pick the best, append to sequence.
-      5. Write output.
     """
     print("=" * 70)
     print("Video Transformer Guided Image Sequencing")
     print("=" * 70)
 
-    # Step 1: Edge maps
-    print("\nStep 1/5: Building edge maps...")
-    edge_maps = build_edge_maps(image_folder)
-    filenames = list(edge_maps.keys())
+    # Step 1: Load image dimensions
+    print("\nStep 1/4: Loading image dimensions...")
+    image_info = load_image_dimensions(image_folder)
+    filenames = list(image_info.keys())
     n = len(filenames)
     print(f"  Found {n} images.\n")
 
@@ -741,12 +545,11 @@ def sequence_with_video_transformer(
         return
 
     # Step 2: CLIP embeddings and KNN
-    print("Step 2/5: Computing CLIP embeddings and KNN graph...")
+    print("Step 2/4: Computing CLIP embeddings and KNN graph...")
     embeddings = compute_clip_embeddings(filenames, image_folder)
     dist_matrix = cdist(embeddings, embeddings, metric="cosine")
     print(f"  Distance matrix: {dist_matrix.shape}\n")
 
-    # Precompute KNN for each image
     knn = {}
     for i in range(n):
         dists = dist_matrix[i].copy()
@@ -754,11 +557,12 @@ def sequence_with_video_transformer(
         nearest = np.argsort(dists)[:k_neighbors]
         knn[i] = nearest.tolist()
 
-    # Precompute valid tile positions for each image
-    print("Step 3/5: Computing valid tile positions...")
+    # Precompute valid tile positions for each image (geometry only)
+    print("Step 3/4: Computing valid tile positions...")
     tile_positions_per_image = {}
     for idx, fn in enumerate(filenames):
-        positions = get_valid_tile_positions(edge_maps[fn])
+        scaled_h, scaled_w = image_info[fn]
+        positions = get_valid_tile_positions(scaled_h, scaled_w)
         tile_positions_per_image[idx] = positions
         if (idx + 1) % 50 == 0 or idx + 1 == n:
             print(
@@ -767,33 +571,32 @@ def sequence_with_video_transformer(
             )
     print()
 
-    # Step 4: Load video transformer
-    print("Step 4/5: Loading video transformer scorer...")
+    # Step 4: Load video transformer and run greedy sequencing
+    print("Step 4/4: Loading video transformer and building sequence...")
     scorer = VideoTransformerScorer(device="cuda")
     scorer.load()
     print()
 
-    # Step 5: Greedy sequencing
-    print("Step 5/5: Greedy sequence construction...")
+    print("Greedy sequence construction...")
     start_idx = find_start_image(dist_matrix)
     print(f"  Starting with image {start_idx}: {filenames[start_idx]}")
 
-    # Initialize sequence
     visited = {start_idx}
     path = [start_idx]
 
-    # Pick a default tile for the start image (center, largest ratio)
-    em = edge_maps[filenames[start_idx]]
-    h, w = em.shape
-    start_ts = int(min(h, w) * TILE_RATIOS[-1])
-    start_ts = max(16, min(start_ts, h, w))
-    start_ty = (h - start_ts) // 2
-    start_tx = (w - start_ts) // 2
-    tile_choices = [(start_ty, start_tx, start_ts)]  # per path index
+    # Default tile for start image: center crop, largest ratio
+    scaled_h, scaled_w = image_info[filenames[start_idx]]
+    start_ts = int(min(scaled_h, scaled_w) * TILE_RATIOS[-1])
+    start_ts = max(16, min(start_ts, scaled_h, scaled_w))
+    start_ty = (scaled_h - start_ts) // 2
+    start_tx = (scaled_w - start_ts) // 2
+    tile_choices = [(start_ty, start_tx, start_ts)]
 
-    # Extract the start frame
     start_frame = extract_tile_rgb(
-        os.path.join(image_folder, filenames[start_idx]), start_ty, start_tx, start_ts
+        os.path.join(image_folder, filenames[start_idx]),
+        start_ty,
+        start_tx,
+        start_ts,
     )
     if start_frame is None:
         img = cv.imread(os.path.join(image_folder, filenames[start_idx]))
@@ -809,14 +612,12 @@ def sequence_with_video_transformer(
 
         # Get K nearest unvisited neighbors
         candidates_idx = []
-        # First check KNN
         for j in knn[current_idx]:
             if j not in visited:
                 candidates_idx.append(j)
             if len(candidates_idx) >= k_neighbors:
                 break
 
-        # If KNN doesn't have enough, search more broadly
         if len(candidates_idx) < k_neighbors:
             dists = dist_matrix[current_idx].copy()
             for v in visited:
@@ -833,7 +634,7 @@ def sequence_with_video_transformer(
             print(f"  No more candidates at step {step + 1}!")
             break
 
-        # For each candidate image, sample tile positions and extract frames
+        # For each candidate, sample tile positions and extract frames
         all_candidate_info = []  # (image_idx, ty, tx, ts, frame)
         for cand_idx in candidates_idx:
             fn = filenames[cand_idx]
@@ -848,14 +649,12 @@ def sequence_with_video_transformer(
                     all_candidate_info.append((cand_idx, ty, tx, ts, frame))
 
         if not all_candidate_info:
-            # Fallback: just pick the nearest unvisited
             best_idx = candidates_idx[0]
             fn = filenames[best_idx]
-            em = edge_maps[fn]
-            h, w = em.shape
-            ts = int(min(h, w) * TILE_RATIOS[-1])
-            ts = max(16, min(ts, h, w))
-            ty, tx = (h - ts) // 2, (w - ts) // 2
+            scaled_h, scaled_w = image_info[fn]
+            ts = int(min(scaled_h, scaled_w) * TILE_RATIOS[-1])
+            ts = max(16, min(ts, scaled_h, scaled_w))
+            ty, tx = (scaled_h - ts) // 2, (scaled_w - ts) // 2
             frame = extract_tile_rgb(os.path.join(image_folder, fn), ty, tx, ts)
             if frame is None:
                 img = cv.imread(os.path.join(image_folder, fn))
@@ -864,7 +663,7 @@ def sequence_with_video_transformer(
                 )
             all_candidate_info = [(best_idx, ty, tx, ts, frame)]
 
-        # Score all candidates with the video transformer
+        # Score all candidates
         context = context_frames[-max_context:]
         candidate_frames_list = [info[4] for info in all_candidate_info]
 
@@ -877,38 +676,40 @@ def sequence_with_video_transformer(
 
         scores = scorer.score_candidates(context, candidate_frames_list)
 
-        # Find best
         best_score_idx = int(np.argmin(scores))
         best_img_idx, best_ty, best_tx, best_ts, best_frame = all_candidate_info[
             best_score_idx
         ]
         best_score = scores[best_score_idx]
 
-        # Add to sequence
         path.append(best_img_idx)
         visited.add(best_img_idx)
         tile_choices.append((best_ty, best_tx, best_ts))
         context_frames.append(best_frame)
 
-        # Keep context bounded
         if len(context_frames) > max_context * 2:
             context_frames = context_frames[-(max_context + 2) :]
 
         elapsed = time.time() - t_start
-        print(f" → {filenames[best_img_idx]} (score={best_score:.6f}, {elapsed:.1f}s)")
+        print(
+            f" → {filenames[best_img_idx]} "
+            f"(tile={best_ts}px @ ({best_ty},{best_tx}), "
+            f"score={best_score:.6f}, {elapsed:.1f}s)"
+        )
 
-        # Periodic checkpoint
         if (step + 1) % 20 == 0:
             _write_sequence(
-                output_file + ".checkpoint", path, filenames, edge_maps, tile_choices
+                output_file + ".checkpoint",
+                path,
+                filenames,
+                image_info,
+                tile_choices,
             )
             print(f"    Checkpoint saved ({step + 1}/{n - 1})")
 
-    # Cleanup
     scorer.unload()
 
-    # Write final output
-    _write_sequence(output_file, path, filenames, edge_maps, tile_choices)
+    _write_sequence(output_file, path, filenames, image_info, tile_choices)
 
     print(f"\nSequence written to {output_file}")
     print(f"Sequenced {len(path)}/{n} images.")
@@ -917,18 +718,17 @@ def sequence_with_video_transformer(
         print(f"  {filenames[idx]}")
 
 
-def _write_sequence(output_file, path, filenames, edge_maps, tile_choices):
-    """Write the sequence file in the same format as sequence_v6.py."""
+def _write_sequence(output_file, path, filenames, image_info, tile_choices):
+    """Write the sequence file: filename,ty,tx,ts,scaled_h,scaled_w"""
     with open(output_file, "w") as f:
         for k, idx in enumerate(path):
             fn = filenames[idx]
-            em = edge_maps[fn]
-            h, w = em.shape
+            scaled_h, scaled_w = image_info[fn]
             ty, tx, ts = tile_choices[k]
-            f.write(f"{fn},{ty},{tx},{ts},{h},{w}\n")
+            f.write(f"{fn},{ty},{tx},{ts},{scaled_h},{scaled_w}\n")
 
 
-# ── Video Generation (reused from sequence_v6.py) ──────────────────────────
+# ── Video Generation ────────────────────────────────────────────────────────
 
 
 def generate_vid(
