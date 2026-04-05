@@ -1268,7 +1268,7 @@ class SequenceEditorApp:
 
 
 def main():
-    sequence_path = "sequence_order_v3.txt"
+    sequence_path = "sequence_order_vt.txt.commit"
     foto_folder = "."
 
     if len(sys.argv) > 1:
