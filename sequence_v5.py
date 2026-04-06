@@ -1614,8 +1614,8 @@ def sequence(
 def generate_vid(
     sequence_file,
     foto_folder,
-    output_path="output_v5.mp4",
-    fps=11,
+    output_path="output_v5_slow.mp4",
+    fps=8,
 ):
     entries = []
     with open(sequence_file, "r") as f:
