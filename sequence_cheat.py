@@ -36,11 +36,15 @@ T_R_MAX = 1.0
 T_R_STRIDE = 0.1
 STRIDE = 50
 TARGET_SHORT_EDGE = 512
-K_NEIGHBORS = 30
-MAX_CONTEXT_FRAMES = 12  # max prior frames to feed as context to the video model
-TILE_CANDIDATES_PER_IMAGE = 20  # max tile positions to evaluate per candidate image
-FRAME_SIZE = 480  # video model input resolution
-BATCH_EVAL_SIZE = 4  # how many candidates to evaluate in parallel
+K_NEIGHBORS = 10
+MAX_CONTEXT_FRAMES = 2  # max prior frames to feed as context to the video model
+TILE_CANDIDATES_PER_IMAGE = 10  # max tile positions to evaluate per candidate image
+FRAME_SIZE = 480  # video model input resolutionv
+
+FRAME_H = 480
+FRAME_W = 720
+
+BATCH_EVAL_SIZE = 5  # how many candidates to evaluate in parallel
 
 # Tile ratios
 TILE_RATIOS = []
@@ -163,9 +167,8 @@ def get_valid_tile_positions(
         positions.append(((scaled_h - ts) // 2, (scaled_w - ts) // 2, ts))
     return positions
 
-
-def extract_tile_rgb(image_path, ty, tx, ts, output_size=FRAME_SIZE):
-    """Extract a tile from the full-resolution image and resize to output_size."""
+def extract_tile_rgb(image_path, ty, tx, ts, output_height=FRAME_H, output_width=FRAME_W):
+    """Extract a tile from the full-resolution image and resize to output dimensions."""
     img = cv.imread(image_path)
     if img is None:
         return None
@@ -191,7 +194,7 @@ def extract_tile_rgb(image_path, ty, tx, ts, output_size=FRAME_SIZE):
 
     crop_rgb = cv.cvtColor(crop, cv.COLOR_BGR2RGB)
     crop_resized = cv.resize(
-        crop_rgb, (output_size, output_size), interpolation=cv.INTER_AREA
+        crop_rgb, (output_width, output_height), interpolation=cv.INTER_AREA
     )
     return crop_resized
 
@@ -260,7 +263,8 @@ class VideoTransformerScorer:
 
         print(f"  Loading video transformer: {self.model_name}...")
         print(f"  This may take a minute and ~20GB VRAM...")
-
+        self._load_vae_only()
+        return 
         try:
             from diffusers import CogVideoXPipeline
 
@@ -303,19 +307,21 @@ class VideoTransformerScorer:
             self.vae = AutoencoderKLCogVideoX.from_pretrained(
                 self.model_name,
                 subfolder="vae",
-                torch_dtype=torch.float16,
-            ).to(self.device)
+                torch_dtype=torch.bfloat16,
+            )
+            # Cast ALL parameters (weights + biases) to bfloat16
+            self.vae = self.vae.to(dtype=torch.bfloat16, device=self.device)
             self.vae.eval()
-            self.vae.enable_slicing()
             self.transformer = None
             self._loaded = True
-            print("  VAE-only scorer loaded.")
+            print("  VAE-only scorer loaded (bfloat16).")
         except Exception as e2:
             print(f"  VAE fallback also failed: {e2}")
             print("  Will use perceptual scoring instead.")
             self._loaded = True
             self.vae = None
             self.transformer = None
+        
 
     def unload(self):
         """Free all model memory."""
@@ -327,21 +333,48 @@ class VideoTransformerScorer:
         torch.cuda.empty_cache()
         gc.collect()
 
-    def _frames_to_tensor(self, frames, size=FRAME_SIZE):
+    def _frames_to_tensor(self, frames, height=FRAME_H, width=FRAME_W):
         """
         Convert list of numpy RGB frames (H, W, 3) uint8 to
         video tensor (B=1, C, T, H, W) normalized to [-1, 1].
+        Pads temporal dimension to 4k+1 as required by CogVideoX VAE.
         """
         tensors = []
-        for f in frames:
-            if f.shape[0] != size or f.shape[1] != size:
-                f = cv.resize(f, (size, size), interpolation=cv.INTER_AREA)
+        for i, f in enumerate(frames):
+            # Validate input frame
+            if f is None:
+                raise ValueError(f"Frame {i} is None")
+            if not isinstance(f, np.ndarray):
+                raise ValueError(f"Frame {i} is not ndarray: {type(f)}")
+            if f.dtype != np.uint8:
+                # Force to uint8 if it's some other dtype
+                if np.isnan(f).any():
+                    raise ValueError(f"Frame {i} has NaN values (dtype={f.dtype})")
+                f = np.clip(f, 0, 255).astype(np.uint8)
+            if f.shape[0] != height or f.shape[1] != width:
+                f = cv.resize(f, (width, height), interpolation=cv.INTER_AREA)
             t = torch.from_numpy(f.copy()).float().permute(2, 0, 1) / 127.5 - 1.0
+            if torch.isnan(t).any():
+                raise ValueError(f"Frame {i} produced NaN after normalization")
             tensors.append(t)
-        video = torch.stack(tensors, dim=0)  # (T, C, H, W)
-        video = video.permute(1, 0, 2, 3).unsqueeze(0)  # (1, C, T, H, W)
-        return video.to(self.device, dtype=torch.float16)
 
+        # CogVideoX VAE temporal downsampling requires T = 4k + 1 frames
+        num_frames = len(tensors)
+        target_t = num_frames
+        remainder = (target_t - 1) % 4
+        if remainder != 0:
+            target_t = target_t + (4 - remainder)
+        # Ensure minimum of 5 frames (4*1 + 1)
+        target_t = max(target_t, 5)
+        # Pad by repeating last frame
+        while len(tensors) < target_t:
+            tensors.append(tensors[-1].clone())
+
+        video = torch.stack(tensors, dim=0)  # (T, C, H, W)
+        video = video.clamp(-1.0, 1.0)
+        video = video.permute(1, 0, 2, 3).unsqueeze(0)  # (1, C, T, H, W)
+        return video.to(self.device, dtype=torch.bfloat16)
+    
     def score_candidates(self, context_frames, candidate_frames):
         """
         Score how well each candidate frame continues the context sequence.
@@ -426,28 +459,66 @@ class VideoTransformerScorer:
         while len(full_seq) < 2:
             full_seq = [full_seq[0]] + full_seq
 
-        full_tensor = self._frames_to_tensor(full_seq)
+        # Validate frames before tensor conversion
+        for i, f in enumerate(full_seq):
+            if f is None:
+                print(f"    Frame {i} is None, falling back to perceptual")
+                return self._score_perceptual_single(context_frames, cand_frame)
+            if not isinstance(f, np.ndarray):
+                print(f"    Frame {i} is {type(f)}, falling back to perceptual")
+                return self._score_perceptual_single(context_frames, cand_frame)
+            if f.dtype != np.uint8:
+                print(f"    Frame {i} has dtype {f.dtype}, shape {f.shape}")
+                if np.isnan(f).any():
+                    print(f"    Frame {i} has NaN! Falling back to perceptual")
+                    return self._score_perceptual_single(context_frames, cand_frame)
 
         try:
-            latent = self.vae.encode(full_tensor).latent_dist.mean
+            full_tensor = self._frames_to_tensor(full_seq)
+
+            # Verify no NaN in input
+            if torch.isnan(full_tensor).any():
+                print("    NaN in input tensor after _frames_to_tensor!")
+                return self._score_perceptual_single(context_frames, cand_frame)
+
+            # Encode
+            encode_out = self.vae.encode(full_tensor)
+            latent = encode_out.latent_dist.mean
+
+            if torch.isnan(latent).any():
+                print(f"    NaN in latent! Input shape: {full_tensor.shape}, "
+                      f"dtype: {full_tensor.dtype}, "
+                      f"min: {full_tensor.min().item():.4f}, "
+                      f"max: {full_tensor.max().item():.4f}")
+                return self._score_perceptual_single(context_frames, cand_frame)
+
+            # Decode
             recon = self.vae.decode(latent).sample
 
-            orig_last = full_tensor[:, :, -1:]
-            recon_last = recon[:, :, -1:]
+            if torch.isnan(recon).any():
+                print("    NaN in reconstruction, falling back to perceptual")
+                return self._score_perceptual_single(context_frames, cand_frame)
+
+            # Compare in float32 for accuracy
+            orig_last = full_tensor[:, :, -1:].float()
+            recon_last = recon[:, :, -1:].float()
             error = F.mse_loss(recon_last, orig_last).item()
 
             if recon.shape[2] >= 2:
                 temporal_diff = F.mse_loss(
-                    recon[:, :, -1:] - recon[:, :, -2:-1],
-                    full_tensor[:, :, -1:] - full_tensor[:, :, -2:-1],
+                    (recon[:, :, -1:] - recon[:, :, -2:-1]).float(),
+                    (full_tensor[:, :, -1:] - full_tensor[:, :, -2:-1]).float(),
                 ).item()
                 error = 0.7 * error + 0.3 * temporal_diff
 
             return error
+        except ValueError as e:
+            print(f"    Frame validation error: {e}")
+            return self._score_perceptual_single(context_frames, cand_frame)
         except Exception as e:
             print(f"    VAE scoring error: {e}")
             return self._score_perceptual_single(context_frames, cand_frame)
-
+    
     def _score_perceptual(self, context_frames, candidate_frames):
         """Perceptual fallback using pixel-space temporal smoothness."""
         return [
@@ -574,6 +645,7 @@ def sequence_with_video_transformer(
     # Step 4: Load video transformer and run greedy sequencing
     print("Step 4/4: Loading video transformer and building sequence...")
     scorer = VideoTransformerScorer(device="cuda")
+    print("here")
     scorer.load()
     print()
 
