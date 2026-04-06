@@ -961,6 +961,7 @@ class SequenceEditorApp:
             self.undo_stack.pop(0)
 
     def _delete_current(self):
+        del_idx = self.current_idx
         if not self.sequence:
             return
         self._push_undo()
@@ -974,6 +975,16 @@ class SequenceEditorApp:
             self.current_idx = 0
 
         self._refresh_queue_listbox()
+        self._queue_selected_idx = del_idx
+
+        # Highlight new
+        if del_idx < len(self._queue_row_widgets):
+            row, name_l, thumb_l = self._queue_row_widgets[del_idx]
+            row.configure(bg="#3c3c3c")
+            name_l.configure(bg="#3c3c3c")
+            thumb_l.configure(bg="#3c3c3c")
+
+        self._update_queue_preview()
         self._render_current()
 
     def _insert_from_queue(self, before=True):
@@ -1275,6 +1286,37 @@ def main():
         sequence_path = sys.argv[1]
     if len(sys.argv) > 2:
         foto_folder = sys.argv[2]
+    if sequence_path == "new":
+        sequence_path = "sequence_order_new.txt"
+    if not os.path.exists(sequence_path):
+        # Create a new sequence file from all images in foto_folder
+        sequence_path = "sequence_order_new.txt"
+        entries = []
+        supported_ext = (".jpg", ".jpeg", ".png", ".tif", ".bmp")
+        for fname in sorted(os.listdir(foto_folder)):
+            if os.path.splitext(fname)[1].lower() in supported_ext:
+                fpath = os.path.join(foto_folder, fname)
+            try:
+                with Image.open(fpath) as img:
+                    w, h = img.size
+                    # Use a low-res reference where the short side is 512
+                    scale = 512 / min(h, w)
+                    ld_h = int(h * scale)
+                    ld_w = int(w * scale)
+                    tile_size = min(ld_h, ld_w)
+
+                    entries.append(
+                        SequenceEntry(
+                            fname, 0, (ld_w - tile_size) // 2, tile_size, ld_h, ld_w
+                        )
+                    )
+            except Exception as e:
+                print(f"Skipping {fname}: {e}")
+        if not entries:
+            print(f"No images found in {foto_folder}")
+            sys.exit(1)
+        save_sequence(entries, sequence_path)
+        print(f"Created new sequence file: {sequence_path} with {len(entries)} images")
 
     if not os.path.exists(sequence_path):
         print(f"Sequence file not found: {sequence_path}")
