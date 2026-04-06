@@ -1763,7 +1763,7 @@ def preview_edges(
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "video":
         foto_folder = sys.argv[2] if len(sys.argv) > 2 else "."
-        generate_vid("sequence_order_v3.txt", foto_folder)
+        generate_vid("sequence_order_new.txt", foto_folder)
     elif len(sys.argv) > 1 and sys.argv[1] == "preview":
         image_folder = sys.argv[2] if len(sys.argv) > 2 else "."
         num = int(sys.argv[3]) if len(sys.argv) > 3 else 6
