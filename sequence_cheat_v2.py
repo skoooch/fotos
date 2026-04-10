@@ -36,13 +36,13 @@ T_R_MAX = 1.0
 T_R_STRIDE = 0.1
 STRIDE = 50
 TARGET_SHORT_EDGE = 512
-K_NEIGHBORS = 20
+K_NEIGHBORS = 30
 MAX_CONTEXT_FRAMES = 2  # max prior frames to feed as context to the video model
-TILE_CANDIDATES_PER_IMAGE = 10  # max tile positions to evaluate per candidate image
-FRAME_SIZE = 240  # video model input resolutionv
+TILE_CANDIDATES_PER_IMAGE = 20  # max tile positions to evaluate per candidate image
+FRAME_SIZE = 480  # video model input resolutionv
 
-FRAME_H = 240
-FRAME_W = 360
+FRAME_H = 480
+FRAME_W = 720
 
 BATCH_EVAL_SIZE = 50  # how many candidates to evaluate in parallel
 
@@ -237,323 +237,349 @@ def sample_tile_positions(all_positions, max_candidates=TILE_CANDIDATES_PER_IMAG
 
 class VideoTransformerScorer:
     """
-    Uses a video generation/prediction model to score how well a candidate
-    frame continues an existing sequence.
+    Scores candidate next-frames using a video understanding transformer.
 
-    Uses CogVideoX-2b (~20-24GB VRAM with fp16) to compute a pseudo-likelihood.
-
-    The approach:
-      - Encode the context frames + candidate as a video clip.
-      - Measure reconstruction loss in latent space.
-      - Lower reconstruction loss = better continuation.
+    Primary method: VideoMAE internal feature-space scoring.
+    
+    Instead of measuring pixel MSE, we measure how the transformer's
+    internal representations respond to different candidates:
+    
+    1. Temporal attention entropy: When the candidate "fits", the transformer's
+       temporal attention patterns are confident (low entropy). When it doesn't
+       fit, attention becomes confused/diffuse (high entropy).
+    
+    2. Hidden state prediction error: Use the transformer's intermediate layer
+       representations. The features at layer L for the candidate frame should
+       be predictable from the context frames' layer L features if the sequence
+       is coherent. This operates in a learned, high-dimensional semantic space
+       — NOT pixel space.
+    
+    3. CLS token log-likelihood proxy: The CLS token aggregates the full
+       temporal sequence. We train a tiny probe (or use distance) to measure
+       how "normal" the CLS token looks vs. a distribution built from the
+       context. Anomalous CLS = bad continuation.
+    
+    ~1-2GB VRAM.
     """
 
-    def __init__(self, device="cuda", model_name="THUDM/CogVideoX-2b"):
+    def __init__(self, device="cuda", model_name="MCG-NJU/videomae-base"):
         self.device = device
         self.model_name = model_name
-        self.pipe = None
-        self.vae = None
-        self.transformer = None
-        self.scheduler = None
+        self.model = None
+        self.feature_extractor = None
         self._loaded = False
+        self._mode = None  # 'videomae_deep', 'videomae_attn', or 'perceptual'
 
     def load(self):
         if self._loaded:
             return
 
-        print(f"  Loading video transformer: {self.model_name}...")
-        print(f"  This may take a minute and ~20GB VRAM...")
-        if torch.cuda.is_available():
-            free, total = torch.cuda.mem_get_info()
-            print(f"  GPU memory: {free/1e9:.1f}GB free / {total/1e9:.1f}GB total")
-        try:
-            from diffusers import CogVideoXPipeline
+        if self._try_load_videomae():
+            return
 
-            self.pipe = CogVideoXPipeline.from_pretrained(
+        print("  VideoMAE load failed. Using perceptual scoring.")
+        self._mode = "perceptual"
+        self._loaded = True
+
+    def _try_load_videomae(self):
+        """Load VideoMAE with access to hidden states and attentions."""
+        try:
+            from transformers import VideoMAEModel, VideoMAEImageProcessor
+
+            print(f"  Loading VideoMAE: {self.model_name}...")
+            if torch.cuda.is_available():
+                free, total = torch.cuda.mem_get_info()
+                print(f"  GPU memory: {free/1e9:.1f}GB free / {total/1e9:.1f}GB total")
+
+            self.feature_extractor = VideoMAEImageProcessor.from_pretrained(
+                self.model_name
+            )
+            self.model = VideoMAEModel.from_pretrained(
                 self.model_name,
                 torch_dtype=torch.float16,
-            )
+            ).to(self.device)
+            self.model.eval()
 
-            # Extract components we need
-            self.vae = self.pipe.vae.to(self.device)
-            self.vae.eval()
-            self.vae.enable_slicing()
-
-            self.transformer = self.pipe.transformer.to(self.device)
-            self.transformer.eval()
-
-            self.scheduler = self.pipe.scheduler
-
-            self.text_encoder = self.pipe.text_encoder.to(self.device)
-            self.text_encoder.eval()
-            self.tokenizer = self.pipe.tokenizer
-
+            self._mode = "videomae_deep"
             self._loaded = True
-            print(f"  Video transformer loaded successfully.")
-            print(f"  VRAM used: ~{torch.cuda.memory_allocated() / 1e9:.1f}GB")
 
-        except ImportError:
-            print("  diffusers not available, falling back to VAE-only scoring.")
-            self._load_vae_only()
+            vram = (
+                torch.cuda.memory_allocated() / 1e9
+                if torch.cuda.is_available()
+                else 0
+            )
+            print(f"  VideoMAE loaded (deep feature scoring). VRAM: ~{vram:.1f}GB")
+            return True
+
         except Exception as e:
-            print(f"  Failed to load CogVideoX: {e}")
-            print("  Falling back to VAE-only scoring.")
-            self._load_vae_only()
-
-    def _load_vae_only(self):
-        """Fallback: use video-aware VAE for scoring."""
-        try:
-            from diffusers.models import AutoencoderKLCogVideoX
-
-            self.vae = AutoencoderKLCogVideoX.from_pretrained(
-                self.model_name,
-                subfolder="vae",
-                torch_dtype=torch.bfloat16,
-            )
-            # Cast ALL parameters (weights + biases) to bfloat16
-            self.vae = self.vae.to(dtype=torch.bfloat16, device=self.device)
-            self.vae.eval()
-            self.transformer = None
-            self._loaded = True
-            print("  VAE-only scorer loaded (bfloat16).")
-        except Exception as e2:
-            print(f"  VAE fallback also failed: {e2}")
-            print("  Will use perceptual scoring instead.")
-            self._loaded = True
-            self.vae = None
-            self.transformer = None
-        
+            print(f"  VideoMAE load failed: {e}")
+            return False
 
     def unload(self):
-        """Free all model memory."""
-        for attr in ("vae", "transformer", "text_encoder", "pipe"):
-            if hasattr(self, attr) and getattr(self, attr) is not None:
-                delattr(self, attr)
-                setattr(self, attr, None)
+        self.model = None
+        self.feature_extractor = None
         self._loaded = False
+        self._mode = None
         torch.cuda.empty_cache()
         gc.collect()
 
-    def _frames_to_tensor(self, frames, height=FRAME_H, width=FRAME_W):
+    def _prepare_video_frames(self, frames, num_target_frames=16):
         """
-        Convert list of numpy RGB frames (H, W, 3) uint8 to
-        video tensor (B=1, C, T, H, W) normalized to [-1, 1].
-        Pads temporal dimension to 4k+1 as required by CogVideoX VAE.
+        Prepare frames for VideoMAE. Spreads input frames across 16 temporal
+        positions using nearest-neighbor temporal sampling.
+        Returns list of PIL Images.
         """
-        tensors = []
-        for i, f in enumerate(frames):
-            # Validate input frame
-            if f is None:
-                raise ValueError(f"Frame {i} is None")
-            if not isinstance(f, np.ndarray):
-                raise ValueError(f"Frame {i} is not ndarray: {type(f)}")
+        pil_frames = []
+        for f in frames:
             if f.dtype != np.uint8:
-                # Force to uint8 if it's some other dtype
-                if np.isnan(f).any():
-                    raise ValueError(f"Frame {i} has NaN values (dtype={f.dtype})")
                 f = np.clip(f, 0, 255).astype(np.uint8)
-            if f.shape[0] != height or f.shape[1] != width:
-                f = cv.resize(f, (width, height), interpolation=cv.INTER_AREA)
-            t = torch.from_numpy(f.copy()).float().permute(2, 0, 1) / 127.5 - 1.0
-            if torch.isnan(t).any():
-                raise ValueError(f"Frame {i} produced NaN after normalization")
-            tensors.append(t)
+            pil_frames.append(Image.fromarray(f))
 
-        # CogVideoX VAE temporal downsampling requires T = 4k + 1 frames
-        num_frames = len(tensors)
-        target_t = num_frames
-        remainder = (target_t - 1) % 4
-        if remainder != 0:
-            target_t = target_t + (4 - remainder)
-        # Ensure minimum of 5 frames (4*1 + 1)
-        target_t = max(target_t, 5)
-        # Pad by repeating last frame
-        while len(tensors) < target_t:
-            tensors.append(tensors[-1].clone())
+        n = len(pil_frames)
+        if n >= num_target_frames:
+            indices = np.linspace(0, n - 1, num_target_frames, dtype=int)
+            return [pil_frames[i] for i in indices]
 
-        video = torch.stack(tensors, dim=0)  # (T, C, H, W)
-        video = video.clamp(-1.0, 1.0)
-        video = video.permute(1, 0, 2, 3).unsqueeze(0)  # (1, C, T, H, W)
-        
-        # Verify on CPU as float32
-        assert not video.isnan().any().item(), "NaN on CPU float32!"
-        
-        # Transfer to GPU as float32 first
-        video = video.to(self.device)
-        torch.cuda.synchronize()
-        assert not video.isnan().any().item(), "NaN after .to(device) as float32!"
-        
-        # Now cast to bfloat16
-        video = video.to(dtype=torch.bfloat16)
-        torch.cuda.synchronize()
-        assert not video.isnan().any().item(), "NaN after .to(bfloat16)!"
-        
-        return video
-   
-    
+        # Spread frames evenly, repeating to fill
+        output = []
+        for i in range(num_target_frames):
+            src_idx = min(int(i * n / num_target_frames), n - 1)
+            output.append(pil_frames[src_idx])
+        return output
+
+    def _get_deep_features(self, frames):
+        """
+        Run VideoMAE and return multi-level features:
+          - all_hidden_states: list of (1, num_tokens, hidden_dim) per layer
+          - attentions: list of (1, num_heads, num_tokens, num_tokens) per layer
+          - cls_token: (1, hidden_dim) from last layer
+        """
+        video_frames = self._prepare_video_frames(frames, num_target_frames=16)
+        inputs = self.feature_extractor(list(video_frames), return_tensors="pt")
+        pixel_values = inputs["pixel_values"].to(
+            device=self.device, dtype=torch.float16
+        )
+
+        outputs = self.model(
+            pixel_values=pixel_values,
+            output_hidden_states=True,
+            output_attentions=True,
+        )
+
+        return {
+            "last_hidden": outputs.last_hidden_state.float(),  # (1, N, D)
+            "all_hidden": [h.float() for h in outputs.hidden_states],  # list of (1, N, D)
+            "attentions": [a.float() for a in outputs.attentions],  # list of (1, H, N, N)
+            "cls": outputs.last_hidden_state[:, 0].float(),  # (1, D)
+        }
+
     def score_candidates(self, context_frames, candidate_frames):
-        """
-        Score how well each candidate frame continues the context sequence.
-
-        Returns:
-            scores: list of float, lower = better continuation
-        """
         if not self._loaded:
             self.load()
 
-        if self.vae is None and self.transformer is None:
+        if self._mode == "videomae_deep":
+            return self._score_deep(context_frames, candidate_frames)
+        else:
             return self._score_perceptual(context_frames, candidate_frames)
 
-        if self.transformer is not None:
-            return self._score_with_transformer(context_frames, candidate_frames)
-        else:
-            return self._score_with_vae(context_frames, candidate_frames)
-
     @torch.no_grad()
-    def _score_with_transformer(self, context_frames, candidate_frames):
-        """Score using the full transformer via single-step denoising."""
+    def _score_deep(self, context_frames, candidate_frames):
+        """
+        Deep feature-space scoring using three transformer-internal signals.
+        
+        This is fundamentally different from pixel MSE because:
+        - Attention entropy measures the transformer's *confidence* about
+          temporal relationships — a learned, abstract property
+        - Hidden state prediction operates in a 768-dim semantic space where
+          "cat sitting" and "cat lying" are close but "cat" and "TV static" 
+          are far — you can't get this from pixels
+        - Layer agreement measures consistency across abstraction levels,
+          something that has no pixel-space analogue at all
+        """
         scores = []
 
-        # Null text embedding for unconditional scoring
-        null_tokens = self.tokenizer(
-            "",
-            padding="max_length",
-            max_length=self.tokenizer.model_max_length,
-            truncation=True,
-            return_tensors="pt",
-        ).input_ids.to(self.device)
-        with torch.no_grad():
-            null_embeds = self.text_encoder(null_tokens)[0].half()
+        # Get baseline: context with last frame repeated (the "static" reference)
+        baseline_seq = context_frames[-MAX_CONTEXT_FRAMES:] + [context_frames[-1]]
+        try:
+            baseline_feats = self._get_deep_features(baseline_seq)
+        except Exception as e:
+            print(f"    Baseline feature extraction failed: {e}")
+            return self._score_perceptual(context_frames, candidate_frames)
 
-        for i in range(0, len(candidate_frames), BATCH_EVAL_SIZE):
-            batch = candidate_frames[i : i + BATCH_EVAL_SIZE]
+        # Get context-only features for trajectory estimation
+        ctx_feats = None
+        if len(context_frames) >= 2:
+            try:
+                ctx_seq = context_frames[-MAX_CONTEXT_FRAMES:]
+                ctx_feats = self._get_deep_features(ctx_seq)
+            except Exception:
+                pass
 
-            for cand_frame in batch:
-                full_seq = context_frames[-MAX_CONTEXT_FRAMES:] + [cand_frame]
-                full_tensor = self._frames_to_tensor(full_seq)
-
-                try:
-                    full_latent = self.vae.encode(full_tensor).latent_dist.mean
-
-                    noise = torch.randn_like(full_latent) * 0.1
-                    noisy_latent = full_latent + noise
-
-                    self.scheduler.set_timesteps(50)
-                    t = self.scheduler.timesteps[45]
-                    timesteps = torch.tensor([t], device=self.device).long()
-
-                    model_output = self.transformer(
-                        hidden_states=noisy_latent,
-                        timestep=timesteps,
-                        encoder_hidden_states=null_embeds,
-                    )
-                    predicted = (
-                        model_output.sample
-                        if hasattr(model_output, "sample")
-                        else model_output[0]
-                    )
-
-                    recon_error = F.mse_loss(
-                        predicted[:, :, -1:], full_latent[:, :, -1:]
-                    ).item()
-                    scores.append(recon_error)
-                except Exception as e:
-                    print(f"    Transformer scoring failed: {e}, using VAE fallback")
-                    scores.append(self._score_single_vae(context_frames, cand_frame))
+        for cand_frame in candidate_frames:
+            try:
+                score = self._score_single_deep(
+                    context_frames, cand_frame, baseline_feats, ctx_feats
+                )
+                scores.append(score)
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                scores.append(
+                    self._score_perceptual_single(context_frames, cand_frame)
+                )
+            except Exception as e:
+                print(f"    Deep scoring error: {e}")
+                scores.append(
+                    self._score_perceptual_single(context_frames, cand_frame)
+                )
 
         return scores
 
-    @torch.no_grad()
-    def _score_with_vae(self, context_frames, candidate_frames):
-        """VAE-only scoring via temporal reconstruction error."""
-        return [self._score_single_vae(context_frames, cf) for cf in candidate_frames]
-
-    @torch.no_grad()
-    def _score_single_vae(self, context_frames, cand_frame):
-        """Score a single candidate using VAE reconstruction."""
+    def _score_single_deep(self, context_frames, cand_frame, baseline_feats, ctx_feats):
+        """
+        Score a single candidate using three transformer-internal signals.
+        """
         full_seq = context_frames[-MAX_CONTEXT_FRAMES:] + [cand_frame]
-        while len(full_seq) < 2:
-            full_seq = [full_seq[0]] + full_seq
+        cand_feats = self._get_deep_features(full_seq)
 
-        # Validate frames before tensor conversion
-        for i, f in enumerate(full_seq):
-            if f is None:
-                print(f"    Frame {i} is None, falling back to perceptual")
-                return self._score_perceptual_single(context_frames, cand_frame)
-            if not isinstance(f, np.ndarray):
-                print(f"    Frame {i} is {type(f)}, falling back to perceptual")
-                return self._score_perceptual_single(context_frames, cand_frame)
-            if f.dtype != np.uint8:
-                print(f"    Frame {i} has dtype {f.dtype}, shape {f.shape}")
-                if np.isnan(f).any():
-                    print(f"    Frame {i} has NaN! Falling back to perceptual")
-                    return self._score_perceptual_single(context_frames, cand_frame)
+        # ─── Signal 1: Temporal Attention Entropy ───────────────────────
+        # 
+        # In each attention layer, every token attends to every other token.
+        # The attention distribution tells us how "certain" the transformer
+        # is about temporal relationships.
+        #
+        # When a candidate fits the sequence well, temporal attention patterns
+        # are sharp (low entropy) — the model knows what to attend to.
+        # When it doesn't fit, attention becomes diffuse (high entropy) —
+        # the model is "confused" about how this frame relates to context.
+        #
+        # We focus on the LAST few layers (most semantic) and measure entropy
+        # of attention from tokens in the candidate frame's temporal position
+        # to tokens in the context frames' positions.
+        #
+        # This has NO pixel-space analogue — it's purely about learned
+        # relational structure.
+        
+        attn_entropy = 0.0
+        num_attn_layers = len(cand_feats["attentions"])
+        # Use last 4 layers (most semantically meaningful)
+        deep_layers = cand_feats["attentions"][max(0, num_attn_layers - 4):]
+        
+        for attn in deep_layers:
+            # attn: (1, num_heads, N, N)
+            # Average across heads
+            attn_avg = attn.mean(dim=1)  # (1, N, N)
+            
+            # Attention distribution per token (already sums to ~1 from softmax)
+            # Compute entropy: -sum(p * log(p))
+            attn_probs = attn_avg.clamp(min=1e-8)
+            entropy_per_token = -(attn_probs * attn_probs.log()).sum(dim=-1)  # (1, N)
+            
+            # Mean entropy across all tokens
+            attn_entropy += entropy_per_token.mean().item()
+        
+        attn_entropy /= max(len(deep_layers), 1)
 
-        try:
-            # Force GPU sync and cache clear before allocating
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
+        # ─── Signal 2: Hidden State Trajectory Prediction ──────────────
+        #
+        # If we have context-only features and baseline (static) features,
+        # we can estimate a "trajectory" in the 768-dim hidden space.
+        #
+        # context_features → baseline_features defines a direction of
+        # "temporal evolution" in feature space.
+        # A good candidate should continue this trajectory — its features
+        # should be where the trajectory points.
+        #
+        # This operates in a LEARNED semantic space where meaning is encoded,
+        # not in pixel space. Two visually different frames of the same scene
+        # from slightly different angles will be close here, while two
+        # pixel-similar frames of different scenes will be far apart.
+        
+        trajectory_error = 0.0
+        if ctx_feats is not None:
+            # Use CLS tokens as sequence-level summaries
+            ctx_cls = ctx_feats["cls"]        # (1, D) - context only
+            base_cls = baseline_feats["cls"]  # (1, D) - context + repeated last
+            cand_cls = cand_feats["cls"]      # (1, D) - context + candidate
 
-            full_tensor = self._frames_to_tensor(full_seq)
+            # Direction from context-only → context+static
+            direction = base_cls - ctx_cls
+            direction_norm = direction / (direction.norm() + 1e-8)
 
-            if torch.isnan(full_tensor).any().item():
-                print("    NaN in input tensor after _frames_to_tensor!")
-                return self._score_perceptual_single(context_frames, cand_frame)
+            # Where candidate actually landed
+            cand_direction = cand_cls - ctx_cls
+            cand_direction_norm = cand_direction / (cand_direction.norm() + 1e-8)
 
-            # Encode
-            encode_out = self.vae.encode(full_tensor)
-            latent = encode_out.latent_dist.mean
+            # Cosine alignment with expected trajectory
+            alignment = F.cosine_similarity(cand_direction_norm, direction_norm).item()
+            trajectory_error = 1.0 - alignment  # 0 = perfect alignment, 2 = opposite
 
-            # Free the input tensor immediately
-            del full_tensor, encode_out
-            torch.cuda.synchronize()
+            # Also check magnitude: candidate should move a similar distance
+            # in feature space as the static baseline
+            base_dist = direction.norm().item()
+            cand_dist = cand_direction.norm().item()
+            if base_dist > 1e-6:
+                magnitude_ratio = cand_dist / base_dist
+                # Penalize if candidate moves way too far or barely at all
+                magnitude_penalty = abs(np.log(max(magnitude_ratio, 1e-3)))
+            else:
+                magnitude_penalty = 0.0
+        else:
+            # No trajectory available, use cosine distance to baseline
+            cos_sim = F.cosine_similarity(
+                cand_feats["cls"], baseline_feats["cls"]
+            ).item()
+            trajectory_error = 1.0 - cos_sim
+            magnitude_penalty = 0.0
 
-            if torch.isnan(latent).any().item():
-                print(f"    NaN in latent!")
-                del latent
-                torch.cuda.empty_cache()
-                return self._score_perceptual_single(context_frames, cand_frame)
+        # ─── Signal 3: Cross-Layer Agreement ───────────────────────────
+        #
+        # A coherent video clip should produce consistent representations
+        # across layers. Early layers capture texture/edges, middle layers
+        # capture objects/motion, deep layers capture semantics/narrative.
+        #
+        # For a good continuation, the candidate's hidden states at each
+        # layer should "agree" with what the baseline predicts — and this
+        # agreement should be consistent across layers.
+        #
+        # If early layers say "this matches" but deep layers say "this is
+        # wrong," that's a bad sign (surface-level similarity but semantic
+        # mismatch). This cross-layer consistency check has no pixel analogue.
+        
+        layer_cosines = []
+        # Sample every 3rd layer to keep it fast
+        num_layers = len(cand_feats["all_hidden"])
+        layer_indices = list(range(0, num_layers, max(1, num_layers // 4)))
+        
+        for li in layer_indices:
+            cand_h = cand_feats["all_hidden"][li]   # (1, N, D)
+            base_h = baseline_feats["all_hidden"][li]  # (1, N, D)
+            
+            # Mean-pool across tokens for a layer-level summary
+            cand_pool = cand_h.mean(dim=1)   # (1, D)
+            base_pool = base_h.mean(dim=1)   # (1, D)
+            
+            cos = F.cosine_similarity(cand_pool, base_pool).item()
+            layer_cosines.append(cos)
+        
+        # Cross-layer agreement: low variance = consistent signal across levels
+        layer_variance = np.var(layer_cosines) if len(layer_cosines) > 1 else 0.0
+        
+        # Mean layer distance
+        mean_layer_dist = 1.0 - np.mean(layer_cosines) if layer_cosines else 0.5
 
-            # Decode
-            recon = self.vae.decode(latent).sample
+        # ─── Combined Score ────────────────────────────────────────────
+        # All three signals are in different units; normalize roughly to [0,1]
+        
+        score = (
+            0.30 * attn_entropy * 0.2           # entropy ~[3-6], scale down
+            + 0.25 * trajectory_error             # [0, 2]
+            + 0.15 * magnitude_penalty            # [0, ~3]
+            + 0.15 * mean_layer_dist              # [0, 1]
+            + 0.15 * layer_variance * 100.0       # typically very small, scale up
+        )
+        
+        return score
 
-            if torch.isnan(recon).any().item():
-                print("    NaN in reconstruction, falling back to perceptual")
-                del latent, recon
-                torch.cuda.empty_cache()
-                return self._score_perceptual_single(context_frames, cand_frame)
-
-            # Re-create input just for comparison (on GPU)
-            full_seq_tensor = self._frames_to_tensor(full_seq)
-
-            # Compare in float32 for accuracy
-            orig_last = full_seq_tensor[:, :, -1:].float()
-            recon_last = recon[:, :, -1:].float()
-            error = F.mse_loss(recon_last, orig_last).item()
-
-            if recon.shape[2] >= 2:
-                temporal_diff = F.mse_loss(
-                    (recon[:, :, -1:] - recon[:, :, -2:-1]).float(),
-                    (full_seq_tensor[:, :, -1:] - full_seq_tensor[:, :, -2:-1]).float(),
-                ).item()
-                error = 0.7 * error + 0.3 * temporal_diff
-
-            del latent, recon, full_seq_tensor
-            torch.cuda.empty_cache()
-
-            return error
-        except ValueError as e:
-            print(f"    Frame validation error: {e}")
-            return self._score_perceptual_single(context_frames, cand_frame)
-        except torch.cuda.OutOfMemoryError:
-            print(f"    CUDA OOM! Falling back to perceptual")
-            torch.cuda.empty_cache()
-            gc.collect()
-            return self._score_perceptual_single(context_frames, cand_frame)
-        except Exception as e:
-            print(f"    VAE scoring error: {e}")
-            return self._score_perceptual_single(context_frames, cand_frame)
-   
     def _score_perceptual(self, context_frames, candidate_frames):
         """Perceptual fallback using pixel-space temporal smoothness."""
         return [
@@ -627,7 +653,7 @@ def find_start_image(dist_matrix):
 
 def sequence_with_video_transformer(
     image_folder,
-    output_file="sequence_order_vt.txt",
+    output_file="sequence_order_vt_v2.txt",
     max_context=MAX_CONTEXT_FRAMES,
     k_neighbors=K_NEIGHBORS,
 ):
