@@ -16,13 +16,20 @@ def create_reduced_dir(in_folder, out_folder, scale=2.5):
     if not os.path.exists(out_folder):
         os.makedirs(out_folder)
     for filename in os.listdir(in_folder):
-        in_fp = os.path.join(in_folder, filename)
-        out_fp = os.path.join(out_folder, filename)
-        image = Image.open(in_fp)
-        image = ImageOps.exif_transpose(image)
-        size = image.size
-        image = image.resize((int(size[0] // scale), int(size[1] // scale)))
-        image.save(out_fp, quality=20, optimize=True)
+        if os.path.splitext(filename)[1].lower() in (
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".tif",
+            ".bmp",
+        ):
+            in_fp = os.path.join(in_folder, filename)
+            out_fp = os.path.join(out_folder, filename)
+            image = Image.open(in_fp)
+            image = ImageOps.exif_transpose(image)
+            size = image.size
+            image = image.resize((int(size[0] // scale), int(size[1] // scale)))
+            image.save(out_fp, quality=20, optimize=True)
 
 
 def get_sobel_img(filepath, out_fp=None):
@@ -343,7 +350,9 @@ def vecLD_to_binary_image(vecLD):
 
 
 if __name__ == "__main__":
-    create_reduced_dir("cusco-3", "cusco_salkantay_med", scale=2.5)
+    create_reduced_dir("sucre_2", "cusco_salkantay_med", scale=2.5)
+    create_reduced_dir("sucre_3", "cusco_salkantay_med", scale=2.5)
+    create_reduced_dir("la-paz", "cusco_salkantay_med", scale=2.5)
     # create_sobel_folder("cusco_salkantay_small")
 
     # vecLD_arr = compute_contour_info("cusco_salkantay_med_vec/vecLDs.mat", 95, True)
