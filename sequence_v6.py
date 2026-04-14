@@ -54,7 +54,12 @@ DISTANCE_METRIC = "embedding"  # "edge_descript", "embedding", or "combined"
 EMBEDDING_WEIGHT = 0.5  # weight for embedding distance in combined mode
 EDGE_METHOD = "hed"  # "hed", "scharr"
 NUM_LOOKBACK = 2
-FACE_ALIGN_WEIGHT = 0.5  # how much face alignment reduces cost (fraction of Chamfer)
+FACE_ALIGN_WEIGHT = 0.3  # how much face alignment reduces cost (fraction of Chamfer)
+
+# ── Multi-signal cost weights ───────────────────────────────────────────────
+CHAMFER_WEIGHT = 0.50     # edge structure continuity
+CLIP_WEIGHT = 0.30        # semantic continuity
+COLOR_WEIGHT = 0.20       # tonal/palette continuity
 
 PREPROCESSED_SEQS = []
 # ── Derived: list of tile ratios to test ─────────────────────────────────────
@@ -317,7 +322,6 @@ def get_weighted_edges(image_path, target_short_edge=TARGET_SHORT_EDGE):
         h, w = img.shape
         scale = target_short_edge / min(h, w)
         
-    # ...existing code (thresholding, CC filtering, gamma)...
     # ── Threshold out low-confidence edge pixels ──
     magnitude[magnitude < EDGE_THRESHOLD_LOW] = 0.0
 
@@ -344,8 +348,6 @@ def get_weighted_edges(image_path, target_short_edge=TARGET_SHORT_EDGE):
 
 
 # ── Cheap Global Descriptor ────────────────────────────────────────────────
-
-
 def compute_image_features(filenames, image_folder):
     """
     Compute CLIP embeddings for all images.
@@ -395,52 +397,72 @@ def compute_image_features(filenames, image_folder):
     print(f"  CLIP embeddings shape: {embeddings.shape}")
     return embeddings.astype(np.float32)
 
-
-def compute_edge_descriptor(edge_map, num_spatial_bins=4, num_orient_bins=8):
+def compute_color_histograms(filenames, image_folder, target_short_edge=TARGET_SHORT_EDGE):
     """
-    Compute a lightweight descriptor from the edge map:
-      - Divide image into spatial grid
-      - In each cell, build a histogram of edge orientations weighted by magnitude
-      - Concatenate into a single vector
-
-    This is essentially a simplified HOG on the edge-strength map.
-    Fast to compute, fast to compare (cosine distance on short vectors).
+    Compute per-image color histograms in LAB space for tonal similarity.
+    
+    LAB is perceptually uniform, so histogram distance correlates with
+    how different two images *look* in terms of color/tone.
+    
+    Returns:
+        np.ndarray of shape (n, num_bins * 3), L2-normalized
     """
-    h, w = edge_map.shape
+    num_bins = 32
+    histograms = []
+    print(f"  Computing color histograms for {len(filenames)} images...")
+    
+    for fn in filenames:
+        path = os.path.join(image_folder, fn)
+        try:
+            img = cv.imread(path)
+            if img is None:
+                histograms.append(np.zeros(num_bins * 3, dtype=np.float32))
+                continue
+            
+            h, w = img.shape[:2]
+            scale = target_short_edge / min(h, w)
+            img = cv.resize(img, (int(w * scale), int(h * scale)), interpolation=cv.INTER_AREA)
+            
+            lab = cv.cvtColor(img, cv.COLOR_BGR2LAB)
+            
+            hist = []
+            # L channel: [0, 256]
+            h_l = cv.calcHist([lab], [0], None, [num_bins], [0, 256]).flatten()
+            # A channel: [0, 256] 
+            h_a = cv.calcHist([lab], [1], None, [num_bins], [0, 256]).flatten()
+            # B channel: [0, 256]
+            h_b = cv.calcHist([lab], [2], None, [num_bins], [0, 256]).flatten()
+            
+            combined = np.concatenate([h_l, h_a, h_b]).astype(np.float32)
+            norm = np.linalg.norm(combined)
+            if norm > 0:
+                combined /= norm
+            histograms.append(combined)
+        except Exception as e:
+            print(f"    Color hist skip {fn}: {e}")
+            histograms.append(np.zeros(num_bins * 3, dtype=np.float32))
+    
+    return np.array(histograms, dtype=np.float32)
 
-    blurred = cv.GaussianBlur((edge_map * 255).astype(np.uint8), (3, 3), 0).astype(
-        np.float32
-    )
-    gx = cv.Scharr(blurred, cv.CV_32F, 1, 0)
-    gy = cv.Scharr(blurred, cv.CV_32F, 0, 1)
-    orientation = np.arctan2(gy, gx)  # [-pi, pi]
-    orientation = (orientation + np.pi) / (2 * np.pi)  # [0, 1]
 
-    descriptor = []
-    cell_h = h // num_spatial_bins
-    cell_w = w // num_spatial_bins
-
-    for si in range(num_spatial_bins):
-        for sj in range(num_spatial_bins):
-            y0 = si * cell_h
-            x0 = sj * cell_w
-            y1 = y0 + cell_h
-            x1 = x0 + cell_w
-
-            mag_cell = edge_map[y0:y1, x0:x1]
-            ori_cell = orientation[y0:y1, x0:x1]
-
-            bins = np.linspace(0, 1, num_orient_bins + 1)
-            hist, _ = np.histogram(
-                ori_cell.ravel(), bins=bins, weights=mag_cell.ravel()
-            )
-            descriptor.extend(hist)
-
-    descriptor = np.array(descriptor, dtype=np.float32)
-    norm = np.linalg.norm(descriptor)
+def compute_tile_color_histogram(img_bgr_tile, num_bins=32):
+    """
+    Compute a normalized LAB color histogram for a single BGR tile crop.
+    Returns a float32 vector of length num_bins * 3.
+    """
+    if img_bgr_tile is None or img_bgr_tile.size == 0:
+        return np.zeros(num_bins * 3, dtype=np.float32)
+    
+    lab = cv.cvtColor(img_bgr_tile, cv.COLOR_BGR2LAB)
+    h_l = cv.calcHist([lab], [0], None, [num_bins], [0, 256]).flatten()
+    h_a = cv.calcHist([lab], [1], None, [num_bins], [0, 256]).flatten()
+    h_b = cv.calcHist([lab], [2], None, [num_bins], [0, 256]).flatten()
+    
+    combined = np.concatenate([h_l, h_a, h_b]).astype(np.float32)
+    norm = np.linalg.norm(combined)
     if norm > 0:
-        descriptor /= norm
-    return descriptor
+        combined /= norm
+    return combined
 
 
 # ── Tile Position Utilities ─────────────────────────────────────────────────
@@ -615,7 +637,17 @@ def scale_bboxes(bboxes, scale):
              "w": b["w"]*scale, "h": b["h"]*scale,
              "confidence": b.get("confidence", 1.0)} for b in bboxes]
 
-def find_all_tile_pair_costs(edge_a, edge_b, bboxes_i, bboxes_j, scale_i, scale_j, tile_ratios=TILE_RATIOS, stride=STRIDE):
+def find_all_tile_pair_costs(edge_a, edge_b, bboxes_i, bboxes_j, scale_i, scale_j,
+                              clip_dist_ij=0.0, img_path_a=None, img_path_b=None,
+                              tile_ratios=TILE_RATIOS, stride=STRIDE):
+    """
+    Compute multi-signal cost for ALL valid tile position combinations.
+    
+    Cost = CHAMFER_WEIGHT * chamfer (edge continuity)
+         + CLIP_WEIGHT * clip_dist (semantic continuity, same for all tiles of this pair)  
+         + COLOR_WEIGHT * color_dist (tonal continuity, per tile pair)
+         - face alignment bonus (multiplicative reduction)
+    """
     h_a, w_a = edge_a.shape
     h_b, w_b = edge_b.shape
     
@@ -637,24 +669,87 @@ def find_all_tile_pair_costs(edge_a, edge_b, bboxes_i, bboxes_j, scale_i, scale_
     if not tiles_a or not tiles_b:
         return {}, inf, None, None
 
+    # Load full images for color histogram computation (once per pair)
+    img_bgr_a = cv.imread(img_path_a) if img_path_a else None
+    img_bgr_b = cv.imread(img_path_b) if img_path_b else None
+    
+    # Precompute color histograms for all tile positions
+    color_hists_a = {}
+    color_hists_b = {}
+    
+    if img_bgr_a is not None and COLOR_WEIGHT > 0:
+        actual_h_a, actual_w_a = img_bgr_a.shape[:2]
+        inv_scale_a = 1.0 / scale_i
+        for ay, ax, a_ts, *_ in tiles_a:
+            key = (ay, ax, a_ts)
+            # Map tile coords from edge-map space to original image space
+            oa_ts = int(a_ts * inv_scale_a)
+            oa_y = int(ay * inv_scale_a)
+            oa_x = int(ax * inv_scale_a)
+            oa_ts = max(16, min(oa_ts, actual_h_a, actual_w_a))
+            oa_y = max(0, min(oa_y, actual_h_a - oa_ts))
+            oa_x = max(0, min(oa_x, actual_w_a - oa_ts))
+            crop = img_bgr_a[oa_y:oa_y + oa_ts, oa_x:oa_x + oa_ts]
+            # Resize to consistent size for histogram comparison
+            crop = cv.resize(crop, (128, 128), interpolation=cv.INTER_AREA)
+            color_hists_a[key] = compute_tile_color_histogram(crop)
+    
+    if img_bgr_b is not None and COLOR_WEIGHT > 0:
+        actual_h_b, actual_w_b = img_bgr_b.shape[:2]
+        inv_scale_b = 1.0 / scale_j
+        for by, bx, b_ts, *_ in tiles_b:
+            key = (by, bx, b_ts)
+            ob_ts = int(b_ts * inv_scale_b)
+            ob_y = int(by * inv_scale_b)
+            ob_x = int(bx * inv_scale_b)
+            ob_ts = max(16, min(ob_ts, actual_h_b, actual_w_b))
+            ob_y = max(0, min(ob_y, actual_h_b - ob_ts))
+            ob_x = max(0, min(ob_x, actual_w_b - ob_ts))
+            crop = img_bgr_b[ob_y:ob_y + ob_ts, ob_x:ob_x + ob_ts]
+            crop = cv.resize(crop, (128, 128), interpolation=cv.INTER_AREA)
+            color_hists_b[key] = compute_tile_color_histogram(crop)
+
     costs = {}
     best_cost = inf
     best_pos_a = (tiles_a[0][0], tiles_a[0][1], tiles_a[0][2])
     best_pos_b = (tiles_b[0][0], tiles_b[0][1], tiles_b[0][2])
 
     for ay, ax, a_ts, mask_a, weights_a, sum_wa, dt_a in tiles_a:
+        hist_a = color_hists_a.get((ay, ax, a_ts))
+        
         for by, bx, b_ts, mask_b, weights_b, sum_wb, dt_b in tiles_b:
+            # Signal 1: Chamfer distance (edge structure continuity)
             d_ab = np.sum(weights_a * dt_b[mask_a]) / sum_wa
             d_ba = np.sum(weights_b * dt_a[mask_b]) / sum_wb
             chamfer = (d_ab + d_ba) / 2.0
 
+            # Signal 2: CLIP distance (semantic continuity — same for all tiles)
+            # Already normalized to [0, 2] (cosine distance)
+            clip_term = clip_dist_ij
+
+            # Signal 3: Color histogram distance (tonal continuity — per tile)
+            color_dist = 0.0
+            hist_b = color_hists_b.get((by, bx, b_ts))
+            if hist_a is not None and hist_b is not None:
+                # Cosine distance between normalized histograms: [0, 2]
+                dot = np.dot(hist_a, hist_b)
+                color_dist = 1.0 - dot  # [0, 2], typically [0, 1]
+            
+            # Combine signals (normalize chamfer to similar scale as others)
+            # Chamfer is in pixels (~0-50 range), CLIP/color are in [0, 2]
+            # We normalize chamfer by dividing by common_size to get ~[0, 1]
+            chamfer_norm = chamfer / max(common_size, 1)
+            
+            cost = (CHAMFER_WEIGHT * chamfer_norm
+                    + CLIP_WEIGHT * clip_term
+                    + COLOR_WEIGHT * color_dist)
+
+            # Face alignment bonus (multiplicative reduction on combined cost)
             if has_faces:
                 bonus = _face_alignment_bonus(
                     ay, ax, a_ts, by, bx, b_ts, scaled_a, scaled_b
                 )
-                cost = chamfer * (1.0 - min(bonus, 0.9))
-            else:
-                cost = chamfer
+                cost *= (1.0 - min(bonus, 0.9))
 
             costs[((ay, ax, a_ts), (by, bx, b_ts))] = cost
             if cost < best_cost:
@@ -667,8 +762,11 @@ def find_all_tile_pair_costs(edge_a, edge_b, bboxes_i, bboxes_j, scale_i, scale_
 
 def _compute_all_pairs(args):
     """Worker for parallel all-tile-pair matching."""
-    i, j, edge_i, edge_j, bboxes_i, bboxes_j, scale_i, scale_j = args
-    costs, best_cost, pos_a, pos_b = find_all_tile_pair_costs(edge_i, edge_j, bboxes_i, bboxes_j, scale_i, scale_j)
+    i, j, edge_i, edge_j, bboxes_i, bboxes_j, scale_i, scale_j, clip_dist_ij, path_i, path_j = args
+    costs, best_cost, pos_a, pos_b = find_all_tile_pair_costs(
+        edge_i, edge_j, bboxes_i, bboxes_j, scale_i, scale_j,
+        clip_dist_ij=clip_dist_ij, img_path_a=path_i, img_path_b=path_j
+    )
     return i, j, costs, best_cost, pos_a, pos_b
 
 # ── Pairwise Cost Matrix (Sparse, KNN-based) ───────────────────────────────
@@ -692,21 +790,33 @@ def build_edge_maps(image_folder, extensions=(".jpg", ".jpeg", ".png", ".tif", "
             seq_dir = os.listdir(os.path.join(image_folder, fn))
             first_last = []
             seq_path = os.path.join(image_folder, fn, "sequence.txt")
-            if os.path.exists(seq_path):
-                with open(seq_path, "r") as f:
-                    cleaned = [line for line in f if line.strip()]
-                    for line in [cleaned[0], cleaned[-1]]:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        parts = line.split(",")
-                        sfn = parts[0]
-                        tile_y, tile_x = int(parts[1]), int(parts[2])
-                        tile_size_ld = int(parts[3])
-                        ld_h, ld_w = int(parts[4]), int(parts[5])
-                        first_last.append((sfn, tile_y, tile_x, tile_size_ld, ld_h, ld_w))
+            if not os.path.exists(seq_path):
+                with open(seq_path, "w") as f:
+                    for file in seq_dir:
+                        if os.path.splitext(file)[1].lower() in extensions:
+                            with Image.open(file) as img:
+                                width, height = img.size
+                                ts = min(width,height)
+                                if width > height:
+                                    f.write(f"{fn},{0},{(width - ts) //2},{ts},{height},{width}\n")
+                                else:
+                                    f.write(f"{fn},{(height - ts) // 2},{0},{ts},{height},{width}\n")
+            with open(seq_path, "r") as f:
+                cleaned = [line for line in f if line.strip()]
+                for line in [cleaned[0], cleaned[-1]]:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parts = line.split(",")
+                    sq_fn = parts[0]
+                    sq_em, sq_sc = get_weighted_edges(path)
+                    edge_maps[sq_fn] = sq_em
+                    edge_scales[sq_fn] = sq_sc
+                    tile_y, tile_x = int(parts[1]), int(parts[2])
+                    tile_size_ld = int(parts[3])
+                    ld_h, ld_w = int(parts[4]), int(parts[5])
+                    first_last.append((sq_fn, tile_y, tile_x, tile_size_ld, ld_h, ld_w))
             PREPROCESSED_SEQS.append((fn, tuple(first_last)))
-
     return edge_maps, edge_scales
 
 def build_knn_shortlist(
@@ -721,54 +831,24 @@ def build_knn_shortlist(
         symmetric_pairs: set of (i, j) tuples with i < j
         neighbors: dict mapping index -> list of neighbor indices
         dist_matrix: np.ndarray coarse distance matrix
+        clip_embeddings: np.ndarray of shape (n, embed_dim) or None
     """
     filenames = list(edge_maps.keys())
     n = len(filenames)
-
-    if distance_metric == "edge_descript":
-        print(f"  Computing edge descriptors for {n} images...")
-        descriptors = np.array(
-            [compute_edge_descriptor(edge_maps[fn]) for fn in filenames]
-        )
-        print(f"  Computing cosine distance matrix...")
-        dist_matrix = cdist(descriptors, descriptors, metric="cosine")
-
-    elif distance_metric == "embedding":
+    clip_embeddings = None
+    if distance_metric == "embedding":
         if image_folder is None:
             raise ValueError("image_folder required for embedding distance metric")
-        embeddings = compute_image_features(filenames, image_folder)
+        clip_embeddings = compute_image_features(filenames, image_folder)
         print(f"  Computing cosine distance matrix from CLIP embeddings...")
-        dist_matrix = cdist(embeddings, embeddings, metric="cosine")
-
-    elif distance_metric == "combined":
-        if image_folder is None:
-            raise ValueError("image_folder required for combined distance metric")
-        print(f"  Computing edge descriptors for {n} images...")
-        edge_descs = np.array(
-            [compute_edge_descriptor(edge_maps[fn]) for fn in filenames]
-        )
-        edge_dist = cdist(edge_descs, edge_descs, metric="cosine")
-
-        embeddings = compute_image_features(filenames, image_folder)
-        embed_dist = cdist(embeddings, embeddings, metric="cosine")
-
-        edge_max = edge_dist.max()
-        embed_max = embed_dist.max()
-        if edge_max > 0:
-            edge_dist_norm = edge_dist / edge_max
-        else:
-            edge_dist_norm = edge_dist
-        if embed_max > 0:
-            embed_dist_norm = embed_dist / embed_max
-        else:
-            embed_dist_norm = embed_dist
-
-        w = EMBEDDING_WEIGHT
-        dist_matrix = (1 - w) * edge_dist_norm + w * embed_dist_norm
-        print(f"  Combined distance matrix: {1-w:.0%} edge + {w:.0%} semantic")
-
+        dist_matrix = cdist(clip_embeddings, clip_embeddings, metric="cosine")
     else:
         raise ValueError(f"Unknown distance_metric: {distance_metric}")
+
+    # If we didn't compute CLIP yet (edge_descript mode), do it now for cost function
+    if clip_embeddings is None and image_folder is not None:
+        print(f"  Computing CLIP embeddings for multi-signal cost...")
+        clip_embeddings = compute_image_features(filenames, image_folder)
 
     # For each image, find K nearest (excluding self)
     neighbors = {}
@@ -790,8 +870,7 @@ def build_knn_shortlist(
         f"{100*len(symmetric_pairs)/(n*(n-1)//2):.1f}%)"
     )
 
-    return filenames, symmetric_pairs, neighbors, dist_matrix
-
+    return filenames, symmetric_pairs, neighbors, dist_matrix, clip_embeddings
 
 def build_sparse_cost_data(
     edge_maps, edge_scales, max_workers=None, k=K_NEIGHBORS, image_folder=None
@@ -801,9 +880,17 @@ def build_sparse_cost_data(
     2. Run expensive ALL tile-pair matching on shortlisted pairs (multi-ratio).
     3. Compute fallback costs for non-shortlisted pairs.
     """
-    filenames, shortlisted_pairs, neighbors, coarse_dist = build_knn_shortlist(
+    filenames, shortlisted_pairs, neighbors, coarse_dist, clip_embeddings = build_knn_shortlist(
         edge_maps, k=k, image_folder=image_folder
     )
+    
+    # Precompute pairwise CLIP distances for shortlisted pairs
+    clip_dist_cache = {}
+    if clip_embeddings is not None:
+        for i, j in shortlisted_pairs:
+            # Cosine distance: 1 - dot(a, b) for L2-normalized vectors
+            clip_dist_cache[(i, j)] = float(1.0 - np.dot(clip_embeddings[i], clip_embeddings[j]))
+    
     _unload_clip_model()
     n = len(filenames)
     with open('face_bboxes.json') as f:
@@ -820,7 +907,10 @@ def build_sparse_cost_data(
     tasks = [
         (i, j, edge_maps[filenames[i]], edge_maps[filenames[j]],
          face_bboxes.get(filenames[i], []), face_bboxes.get(filenames[j], []),
-         edge_scales[filenames[i]], edge_scales[filenames[j]])
+         edge_scales[filenames[i]], edge_scales[filenames[j]],
+         clip_dist_cache.get((i, j), 0.5),
+         os.path.join(image_folder, filenames[i]) if image_folder else None,
+         os.path.join(image_folder, filenames[j]) if image_folder else None)
         for i, j in shortlisted_pairs
     ]
 
@@ -829,6 +919,7 @@ def build_sparse_cost_data(
         f"  All-tile-pair matching {total} shortlisted pairs (of {n*(n-1)//2} total)..."
     )
     print(f"  Tile ratios: {TILE_RATIOS}")
+    print(f"  Cost weights: chamfer={CHAMFER_WEIGHT}, clip={CLIP_WEIGHT}, color={COLOR_WEIGHT}")
     print(
         f"  Avg tile positions per image: {np.mean([len(v) for v in tile_positions_per_image.values()]):.1f}"
     )
