@@ -18,6 +18,7 @@ shortlisted pair, then the greedy/2-opt solvers track per-image tile state.
 import os
 import sys
 import pickle
+import json
 from math import inf
 from itertools import combinations
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -34,7 +35,7 @@ from PIL import Image
 # ── Config ──────────────────────────────────────────────────────────────────
 TILE_RATIO = 0.75
 T_R_MAX = 1
-T_R_MIN = 0.6
+T_R_MIN = 0.7
 T_R_STRIDE = 0.1
 STRIDE = 50  # coarser stride for expanded tile-pair search
 EDGE_BLUR_KSIZE = 3
@@ -42,7 +43,7 @@ EDGE_GAMMA = 1.5  # >1 suppresses weak edges, amplifies strong ones
 MIN_EDGE_LENGTH = 30  # minimum connected-component size in pixels to keep
 EDGE_THRESHOLD_LOW = 0.6  # discard edge pixels below this strength
 NUM_2OPT_ITERATIONS = 50
-K_NEIGHBORS = 30  # only tile-match the K most promising neighbors per image
+K_NEIGHBORS = 35  # only tile-match the K most promising neighbors per image
 TARGET_SHORT_EDGE = 512
 EDGE_THRESHOLD = 0.1
 MIN_EDGE_DENSITY = 0.01
@@ -52,7 +53,10 @@ REFINE_ITERATIONS = 4  # number of forward+backward sweeps
 DISTANCE_METRIC = "embedding"  # "edge_descript", "embedding", or "combined"
 EMBEDDING_WEIGHT = 0.5  # weight for embedding distance in combined mode
 EDGE_METHOD = "hed"  # "hed", "scharr"
+NUM_LOOKBACK = 2
+FACE_ALIGN_WEIGHT = 0.5  # how much face alignment reduces cost (fraction of Chamfer)
 
+PREPROCESSED_SEQS = []
 # ── Derived: list of tile ratios to test ─────────────────────────────────────
 TILE_RATIOS = []
 _r = T_R_MIN
@@ -295,15 +299,25 @@ def get_weighted_edges(image_path, target_short_edge=TARGET_SHORT_EDGE):
       1. Threshold out low-confidence pixels
       2. Connected-component filtering to remove small fragments
       3. Gamma correction to further separate strong from weak
+    
+    Returns:
+        magnitude: float32 edge map
+        scale: float, the scale factor from original image to edge map coords
     """
     if EDGE_METHOD == "hed":
         img_bgr = cv.imread(image_path)
         if img_bgr is None:
             raise FileNotFoundError(f"Cannot read {image_path}")
+        h, w = img_bgr.shape[:2]
+        scale = target_short_edge / min(h, w)
         magnitude = _hed_edge_map(img_bgr, target_short_edge)
     else:
         magnitude = _scharr_edge_map(image_path, target_short_edge)
-
+        img = cv.imread(image_path, cv.IMREAD_GRAYSCALE)
+        h, w = img.shape
+        scale = target_short_edge / min(h, w)
+        
+    # ...existing code (thresholding, CC filtering, gamma)...
     # ── Threshold out low-confidence edge pixels ──
     magnitude[magnitude < EDGE_THRESHOLD_LOW] = 0.0
 
@@ -326,7 +340,7 @@ def get_weighted_edges(image_path, target_short_edge=TARGET_SHORT_EDGE):
     # ── Gamma correction ──
     magnitude = np.power(magnitude, EDGE_GAMMA)
 
-    return magnitude.astype(np.float32)
+    return magnitude.astype(np.float32), scale
 
 
 # ── Cheap Global Descriptor ────────────────────────────────────────────────
@@ -532,30 +546,87 @@ def get_tile_positions_for_image(edge_map, tile_ratios=TILE_RATIOS, stride=STRID
 
 
 # ── All Tile-Pair Cost Computation ──────────────────────────────────────────
-
-
-def find_all_tile_pair_costs(edge_a, edge_b, tile_ratios=TILE_RATIOS, stride=STRIDE):
+def _face_alignment_bonus(ay, ax, a_ts, by, bx, b_ts, bboxes_a, bboxes_b):
     """
-    Compute Chamfer cost for ALL valid tile position combinations between
-    two images, across ALL tile ratios.
-
-    Tiles of different sizes are resized to a common comparison size
-    (the smallest tile size across both images) before computing Chamfer distance.
-
+    Compute a cost reduction for face alignment between two tiles.
+    
+    For each face in image A's tile, find the best-matching face in image B's tile.
+    Measure how closely the face centers align (in normalized tile coordinates).
+    
     Returns:
-        costs: dict mapping ((ay, ax, a_ts), (by, bx, b_ts)) -> cost
-        best_cost: float (minimum cost across all pairs)
-        best_pos_a: (y, x, tile_size) of best tile in image a
-        best_pos_b: (y, x, tile_size) of best tile in image b
+        bonus: float >= 0. Higher = better alignment = more cost reduction.
+               0 if no faces in either tile.
     """
+    def faces_in_tile(bboxes, ty, tx, ts):
+        results = []
+        for bbox in bboxes:
+            fx, fy, fw, fh, conf = bbox["x"], bbox["y"], bbox["w"], bbox["h"], bbox["confidence"]
+            fcx = fx + fw / 2.0
+            fcy = fy + fh / 2.0
+            if ty <= fcy <= ty + ts and tx <= fcx <= tx + ts:
+                cx_norm = (fcx - tx) / ts
+                cy_norm = (fcy - ty) / ts
+                size_norm = (fw * fh) / (ts * ts)
+                results.append((cx_norm, cy_norm, size_norm, conf))
+        return results
+
+    faces_a = faces_in_tile(bboxes_a, ay, ax, a_ts)
+    faces_b = faces_in_tile(bboxes_b, by, bx, b_ts)
+
+    total_align = 0.0
+    matched = 0
+
+    for (cxa, cya, sa, conf_a) in faces_a:
+        best_dist = inf
+        best_size_match = 0.0
+        best_conf_weight = 0.0
+        for (cxb, cyb, sb, conf_b) in faces_b:
+            # Raw positional distance (confidence applied to the BONUS, not the distance)
+            dist = np.sqrt((cxa - cxb) ** 2 + (cya - cyb) ** 2)
+            if dist < best_dist:
+                best_dist = dist
+                if sa > 0 and sb > 0:
+                    ratio = min(sa, sb) / max(sa, sb)
+                else:
+                    ratio = 0.0
+                best_size_match = ratio
+                # Higher confidence = this face matters more = bigger bonus when aligned
+                best_conf_weight = conf_a * conf_b
+
+        if best_dist < 1.0:
+            position_score = max(0.0, 1.0 - best_dist)
+            align_score = position_score * (0.7 + 0.3 * best_size_match)
+            # Confidence amplifies the bonus: confident faces produce stronger alignment signal
+            align_score *= best_conf_weight
+            total_align += align_score
+            matched += 1
+
+    if matched > 0:
+        total_align /= matched
+
+    return total_align * FACE_ALIGN_WEIGHT
+
+# Scale face bboxes from original image coords to edge map coords
+def scale_bboxes(bboxes, scale):
+    """Scale face bboxes from original image coords to edge map coords."""
+    if not bboxes:
+        return []
+    return [{"x": b["x"]*scale, "y": b["y"]*scale,
+             "w": b["w"]*scale, "h": b["h"]*scale,
+             "confidence": b.get("confidence", 1.0)} for b in bboxes]
+
+def find_all_tile_pair_costs(edge_a, edge_b, bboxes_i, bboxes_j, scale_i, scale_j, tile_ratios=TILE_RATIOS, stride=STRIDE):
     h_a, w_a = edge_a.shape
     h_b, w_b = edge_b.shape
-
-    # Common comparison size: smallest tile across all ratios and both images
+    
     min_dim = min(h_a, w_a, h_b, w_b)
     common_size = int(min_dim * min(tile_ratios))
     if common_size < 16:
         common_size = 16
+
+    scaled_a = scale_bboxes(bboxes_i, scale_i)
+    scaled_b = scale_bboxes(bboxes_j, scale_j)
+    has_faces = bool(scaled_a) and bool(scaled_b)
 
     positions_a = _tile_positions_multi(h_a, w_a, tile_ratios, stride)
     positions_b = _tile_positions_multi(h_b, w_b, tile_ratios, stride)
@@ -575,7 +646,16 @@ def find_all_tile_pair_costs(edge_a, edge_b, tile_ratios=TILE_RATIOS, stride=STR
         for by, bx, b_ts, mask_b, weights_b, sum_wb, dt_b in tiles_b:
             d_ab = np.sum(weights_a * dt_b[mask_a]) / sum_wa
             d_ba = np.sum(weights_b * dt_a[mask_b]) / sum_wb
-            cost = (d_ab + d_ba) / 2.0
+            chamfer = (d_ab + d_ba) / 2.0
+
+            if has_faces:
+                bonus = _face_alignment_bonus(
+                    ay, ax, a_ts, by, bx, b_ts, scaled_a, scaled_b
+                )
+                cost = chamfer * (1.0 - min(bonus, 0.9))
+            else:
+                cost = chamfer
+
             costs[((ay, ax, a_ts), (by, bx, b_ts))] = cost
             if cost < best_cost:
                 best_cost = cost
@@ -587,27 +667,47 @@ def find_all_tile_pair_costs(edge_a, edge_b, tile_ratios=TILE_RATIOS, stride=STR
 
 def _compute_all_pairs(args):
     """Worker for parallel all-tile-pair matching."""
-    i, j, edge_i, edge_j = args
-    costs, best_cost, pos_a, pos_b = find_all_tile_pair_costs(edge_i, edge_j)
+    i, j, edge_i, edge_j, bboxes_i, bboxes_j, scale_i, scale_j = args
+    costs, best_cost, pos_a, pos_b = find_all_tile_pair_costs(edge_i, edge_j, bboxes_i, bboxes_j, scale_i, scale_j)
     return i, j, costs, best_cost, pos_a, pos_b
-
 
 # ── Pairwise Cost Matrix (Sparse, KNN-based) ───────────────────────────────
 
 
 def build_edge_maps(image_folder, extensions=(".jpg", ".jpeg", ".png", ".tif", ".bmp")):
     """Load all images from a folder and compute weighted edge maps."""
-    edge_maps = {}
+    edge_maps = {}   # fn -> edge_map (float32)
+    edge_scales = {} # fn -> scale factor (float)
     for fn in sorted(os.listdir(image_folder)):
         if os.path.splitext(fn)[1].lower() in extensions:
             path = os.path.join(image_folder, fn)
             try:
-                edge_maps[fn] = get_weighted_edges(path)
-                print(f"  edges: {fn}  shape={edge_maps[fn].shape}")
+                em, sc = get_weighted_edges(path)
+                edge_maps[fn] = em
+                edge_scales[fn] = sc
+                print(f"  edges: {fn}  shape={em.shape}  scale={sc:.4f}")
             except Exception as e:
                 print(f"  SKIP {fn}: {e}")
-    return edge_maps
+        elif "seq" in fn and os.path.isdir(os.path.join(image_folder, fn)):
+            seq_dir = os.listdir(os.path.join(image_folder, fn))
+            first_last = []
+            seq_path = os.path.join(image_folder, fn, "sequence.txt")
+            if os.path.exists(seq_path):
+                with open(seq_path, "r") as f:
+                    cleaned = [line for line in f if line.strip()]
+                    for line in [cleaned[0], cleaned[-1]]:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        parts = line.split(",")
+                        sfn = parts[0]
+                        tile_y, tile_x = int(parts[1]), int(parts[2])
+                        tile_size_ld = int(parts[3])
+                        ld_h, ld_w = int(parts[4]), int(parts[5])
+                        first_last.append((sfn, tile_y, tile_x, tile_size_ld, ld_h, ld_w))
+            PREPROCESSED_SEQS.append((fn, tuple(first_last)))
 
+    return edge_maps, edge_scales
 
 def build_knn_shortlist(
     edge_maps, k=K_NEIGHBORS, distance_metric=DISTANCE_METRIC, image_folder=None
@@ -694,40 +794,33 @@ def build_knn_shortlist(
 
 
 def build_sparse_cost_data(
-    edge_maps, max_workers=None, k=K_NEIGHBORS, image_folder=None
+    edge_maps, edge_scales, max_workers=None, k=K_NEIGHBORS, image_folder=None
 ):
     """
     1. Build KNN shortlist using cheap descriptors.
     2. Run expensive ALL tile-pair matching on shortlisted pairs (multi-ratio).
     3. Compute fallback costs for non-shortlisted pairs.
-
-    Returns:
-        filenames: list of filenames
-        all_pair_costs: dict (i,j) -> {((ay,ax,a_ts),(by,bx,b_ts)): cost, ...}
-                        where i < j, keyed as canonical (min,max) pairs
-        best_costs: dict (i,j) -> float, best cost per pair (for fallback matrix)
-        tile_positions_per_image: dict idx -> list of (y,x,tile_size) valid positions
-        fallback_cost_matrix: n×n array with coarse costs for non-shortlisted
-        coarse_dist: n×n raw coarse distance matrix
     """
     filenames, shortlisted_pairs, neighbors, coarse_dist = build_knn_shortlist(
         edge_maps, k=k, image_folder=image_folder
     )
     _unload_clip_model()
     n = len(filenames)
+    with open('face_bboxes.json') as f:
+        face_bboxes = json.load(f)
+    
+    all_pair_costs = {}
+    best_costs = {}
 
-    all_pair_costs = {}  # (i,j) -> {((ay,ax,a_ts),(by,bx,b_ts)): cost}
-    best_costs = {}  # (i,j) -> float
-
-    # Precompute tile positions per image (multi-ratio)
     tile_positions_per_image = {}
     for idx, fn in enumerate(filenames):
         positions = get_tile_positions_for_image(edge_maps[fn])
         tile_positions_per_image[idx] = positions
 
-    # Prepare tasks for shortlisted pairs
     tasks = [
-        (i, j, edge_maps[filenames[i]], edge_maps[filenames[j]])
+        (i, j, edge_maps[filenames[i]], edge_maps[filenames[j]],
+         face_bboxes.get(filenames[i], []), face_bboxes.get(filenames[j], []),
+         edge_scales[filenames[i]], edge_scales[filenames[j]])
         for i, j in shortlisted_pairs
     ]
 
@@ -758,7 +851,7 @@ def build_sparse_cost_data(
                 if done % 100 == 0 or done == total:
                     print(f"    {done}/{total} pairs computed")
 
-    # Build fallback cost matrix for non-shortlisted pairs
+    # ...existing code (fallback cost matrix building)...
     best_cost_matrix = np.full((n, n), inf)
     for (i, j), cost in best_costs.items():
         best_cost_matrix[i, j] = cost
@@ -797,7 +890,6 @@ def build_sparse_cost_data(
         fallback_cost_matrix,
         coarse_dist,
     )
-
 
 # ── Tile-Aware Cost Lookup ──────────────────────────────────────────────────
 
@@ -842,7 +934,7 @@ def lookup_cost(i, j, pos_i, pos_j, all_pair_costs, fallback_cost_matrix):
 
 
 def best_cost_for_arrival(
-    i, j, pos_i, all_pair_costs, fallback_cost_matrix, tile_positions_j
+    i, j, pos_i, all_pair_costs, fallback_cost_matrix, tile_positions_j, pos_tails
 ):
     """
     Given that image i is locked at pos_i (y, x, tile_size), find the best
@@ -866,9 +958,29 @@ def best_cost_for_arrival(
             tile_key = (pos_i, pos_j)
         else:
             tile_key = (pos_j, pos_i)
-
-        cost = pair_costs.get(tile_key)
-        if cost is not None and cost < best_cost:
+        
+        base_cost = pair_costs.get(tile_key)
+        if base_cost is None:
+            continue
+        
+        tail_cost = 0
+        for tail_i, pos_tail_tuple in enumerate(pos_tails):
+            if pos_tail_tuple is not None:
+                (tail, pos_tail) = pos_tail_tuple
+                tail_key = (min(tail, j), max(tail, j))
+                tail_pair_costs = all_pair_costs.get(tail_key)
+                if tail_pair_costs is not None:
+                    if tail < j:
+                        tile_key_tail = (pos_tail, pos_j)
+                    else:
+                        tile_key_tail = (pos_j, pos_tail)
+                    tail_cost_add = tail_pair_costs.get(tile_key_tail)
+                    tail_cost += (tail_cost_add if tail_cost_add is not None else fallback_cost_matrix[tail, j]) * (0.5**(tail_i + 1))
+                else:
+                    tail_cost += fallback_cost_matrix[tail, j] * (0.5**(tail_i + 1))
+        
+        cost = base_cost + tail_cost
+        if cost < best_cost:
             best_cost = cost
             best_pos_j = pos_j
 
@@ -931,6 +1043,7 @@ def greedy_nearest_neighbor_tileaware(
     best_path = None
     best_total = inf
     best_positions = None
+    
 
     rng = np.random.default_rng(42)
     num_starts = min(50, n) if n > 200 else n
@@ -943,6 +1056,7 @@ def greedy_nearest_neighbor_tileaware(
         total = 0.0
         current = start
         cur_positions = {}  # image_idx -> (ty, tx, tile_size)
+        pos_tails = [None for i in range(NUM_LOOKBACK)]
 
         for _ in range(n - 1):
             best_nxt = None
@@ -965,6 +1079,7 @@ def greedy_nearest_neighbor_tileaware(
                         all_pair_costs,
                         fallback_cost_matrix,
                         tile_positions_per_image.get(j, []),
+                        pos_tails
                     )
                     if cost < best_nxt_cost:
                         best_nxt_cost = cost
@@ -990,7 +1105,9 @@ def greedy_nearest_neighbor_tileaware(
                 cur_positions[current] = best_nxt_pos_cur
             if best_nxt_pos_nxt is not None:
                 cur_positions[best_nxt] = best_nxt_pos_nxt
-
+            for lookback_i in range(NUM_LOOKBACK - 1, 0, -1):
+                pos_tails[lookback_i] = pos_tails[lookback_i-1]
+            pos_tails[0] = (current, best_nxt_pos_cur)
             total += best_nxt_cost
             path.append(best_nxt)
             visited.add(best_nxt)
@@ -1014,7 +1131,7 @@ def _optimize_positions_for_path(
     positions,
     all_pair_costs,
     fallback_cost_matrix,
-    tile_positions_per_image,
+    tile_positions_per_image
 ):
     """
     Given a fixed path ordering, optimize tile positions for each image
@@ -1023,7 +1140,6 @@ def _optimize_positions_for_path(
     Modifies `positions` in-place and returns the total cost.
     """
     n = len(path)
-
     for sweep in range(2):  # forward then backward
         if sweep == 0:
             order = range(n)
@@ -1054,7 +1170,7 @@ def _optimize_positions_for_path(
                         prev_pos,
                         pos,
                         all_pair_costs,
-                        fallback_cost_matrix,
+                        fallback_cost_matrix
                     )
                 if next_idx is not None:
                     next_pos = positions.get(next_idx)
@@ -1064,7 +1180,7 @@ def _optimize_positions_for_path(
                         pos,
                         next_pos,
                         all_pair_costs,
-                        fallback_cost_matrix,
+                        fallback_cost_matrix
                     )
                 if cost < best_cost:
                     best_cost = cost
@@ -1083,7 +1199,7 @@ def _optimize_positions_for_path(
             positions.get(i),
             positions.get(j),
             all_pair_costs,
-            fallback_cost_matrix,
+            fallback_cost_matrix
         )
     return total
 
@@ -1114,16 +1230,26 @@ def two_opt_tileaware(
 ):
     """
     Improve a path by repeatedly reversing sub-segments, with tile-position
-    awareness.
-
-    After each accepted swap, we re-optimize tile positions at the affected
-    boundary nodes to get an accurate cost comparison.
+    awareness and NUM_LOOKBACK cost evaluation.
     """
     best = path[:]
     best_positions = dict(positions)
     best_cost = _path_cost_tileaware(
         best, best_positions, all_pair_costs, fallback_cost_matrix
     )
+
+    def _window_cost(p, pos, start, end):
+        """Cost of edges in p[start..end], i.e. sum of p[k]->p[k+1] for k in [start, end)."""
+        c = 0.0
+        for k in range(start, end):
+            if k < 0 or k + 1 >= len(p):
+                continue
+            c += lookup_cost(
+                p[k], p[k + 1],
+                pos.get(p[k]), pos.get(p[k + 1]),
+                all_pair_costs, fallback_cost_matrix,
+            )
+        return c
 
     improved = True
     iteration = 0
@@ -1134,107 +1260,70 @@ def two_opt_tileaware(
 
         for i in range(1, len(best) - 1):
             for j in range(i + 1, len(best)):
-                # Current edges: (i-1, i) and (j, j+1 if exists)
-                a, b = best[i - 1], best[i]
-                c = best[j]
-                d = best[j + 1] if j + 1 < len(best) else None
+                # Evaluate the full affected window including lookback
+                window_start = max(0, i - NUM_LOOKBACK)
+                window_end = min(len(best) - 1, j + NUM_LOOKBACK)
 
-                old_cost = lookup_cost(
-                    a,
-                    b,
-                    best_positions.get(a),
-                    best_positions.get(b),
-                    all_pair_costs,
-                    fallback_cost_matrix,
-                )
-                new_cost = lookup_cost(
-                    a,
-                    c,
-                    best_positions.get(a),
-                    best_positions.get(c),
-                    all_pair_costs,
-                    fallback_cost_matrix,
-                )
+                old_window_cost = _window_cost(best, best_positions, window_start, window_end)
 
-                if d is not None:
-                    old_cost += lookup_cost(
-                        c,
-                        d,
-                        best_positions.get(c),
-                        best_positions.get(d),
-                        all_pair_costs,
-                        fallback_cost_matrix,
-                    )
-                    new_cost += lookup_cost(
-                        b,
-                        d,
-                        best_positions.get(b),
-                        best_positions.get(d),
-                        all_pair_costs,
-                        fallback_cost_matrix,
-                    )
+                # Build candidate with reversed segment
+                candidate = best[:i] + best[i : j + 1][::-1] + best[j + 1:]
+                candidate_positions = dict(best_positions)
 
-                if new_cost < old_cost:
-                    # Accept the reversal
-                    candidate = best[:i] + best[i : j + 1][::-1] + best[j + 1 :]
-                    candidate_positions = dict(best_positions)
+                # Re-optimize tile positions at boundary + lookback nodes
+                boundary_indices = set()
+                for offset in range(NUM_LOOKBACK + 1):
+                    if i - offset >= 0:
+                        boundary_indices.add(i - offset)
+                    if i + offset < len(candidate):
+                        boundary_indices.add(i + offset)
+                    if j - offset >= 0:
+                        boundary_indices.add(j - offset)
+                    if j + offset < len(candidate):
+                        boundary_indices.add(j + offset)
 
-                    # Re-optimize tile positions at the boundary nodes
-                    boundary_indices = set()
-                    if i - 1 >= 0:
-                        boundary_indices.add(i - 1)
-                    boundary_indices.add(i)
-                    boundary_indices.add(j)
-                    if j + 1 < len(candidate):
-                        boundary_indices.add(j + 1)
+                for k in sorted(boundary_indices):
+                    idx = candidate[k]
+                    candidates_pos = tile_positions_per_image.get(idx, [])
+                    if not candidates_pos:
+                        continue
 
-                    for k in boundary_indices:
-                        idx = candidate[k]
-                        candidates_pos = tile_positions_per_image.get(idx, [])
-                        if not candidates_pos:
-                            continue
+                    best_pos = candidate_positions.get(idx)
+                    best_local_cost = inf
 
-                        prev_idx = candidate[k - 1] if k > 0 else None
-                        next_idx = candidate[k + 1] if k < len(candidate) - 1 else None
-
-                        best_pos = candidate_positions.get(idx)
-                        best_local_cost = inf
-
-                        for pos in candidates_pos:
-                            cost = 0.0
-                            if prev_idx is not None:
+                    for pos in candidates_pos:
+                        cost = 0.0
+                        # Check all edges within lookback range of this node
+                        for offset in range(1, NUM_LOOKBACK + 1):
+                            if k - offset >= 0:
+                                nb = candidate[k - offset]
                                 cost += lookup_cost(
-                                    prev_idx,
-                                    idx,
-                                    candidate_positions.get(prev_idx),
-                                    pos,
-                                    all_pair_costs,
-                                    fallback_cost_matrix,
-                                )
-                            if next_idx is not None:
+                                    nb, idx,
+                                    candidate_positions.get(nb), pos,
+                                    all_pair_costs, fallback_cost_matrix,
+                                ) * (0.5 ** (offset - 1))
+                            if k + offset < len(candidate):
+                                nb = candidate[k + offset]
                                 cost += lookup_cost(
-                                    idx,
-                                    next_idx,
-                                    pos,
-                                    candidate_positions.get(next_idx),
-                                    all_pair_costs,
-                                    fallback_cost_matrix,
-                                )
-                            if cost < best_local_cost:
-                                best_local_cost = cost
-                                best_pos = pos
+                                    idx, nb,
+                                    pos, candidate_positions.get(nb),
+                                    all_pair_costs, fallback_cost_matrix,
+                                ) * (0.5 ** (offset - 1))
 
-                        if best_pos is not None:
-                            candidate_positions[idx] = best_pos
+                        if cost < best_local_cost:
+                            best_local_cost = cost
+                            best_pos = pos
 
-                    # Recompute full cost for accuracy
+                    if best_pos is not None:
+                        candidate_positions[idx] = best_pos
+
+                new_window_cost = _window_cost(candidate, candidate_positions, window_start, window_end)
+
+                if new_window_cost < old_window_cost:
+                    # Verify with full path cost
                     candidate_cost = _path_cost_tileaware(
-                        candidate,
-                        candidate_positions,
-                        all_pair_costs,
-                        fallback_cost_matrix,
+                        candidate, candidate_positions, all_pair_costs, fallback_cost_matrix
                     )
-
                     if candidate_cost < best_cost:
                         best = candidate
                         best_positions = candidate_positions
@@ -1244,7 +1333,6 @@ def two_opt_tileaware(
         print(f"  2-opt iteration {iteration}: cost = {best_cost:.2f}")
 
     return best, best_cost, best_positions
-
 
 # ── Tile Position Refinement ────────────────────────────────────────────────
 
@@ -1288,29 +1376,20 @@ def refine_tile_positions(
     filenames,
     edge_maps,
     tile_positions,
+    edge_scales=None,
+    face_bboxes=None,
     tile_ratios=TILE_RATIOS,
     refine_stride=REFINE_STRIDE,
     refine_radius=REFINE_RADIUS,
     num_iterations=REFINE_ITERATIONS,
 ):
-    """
-    After sequencing, refine each image's tile position to minimize the
-    sum of Chamfer distances to its predecessor and successor.
-
-    This uses a much finer stride than the initial tile matching, since
-    we only search a small neighborhood around the current position and
-    only consider adjacent pairs. Searches across all tile ratios.
-
-    Args:
-        path: sequence of image indices
-        filenames: list of filenames
-        edge_maps: dict fn -> edge map
-        tile_positions: dict image_idx -> (ty, tx, tile_size) from the tile-aware solver
-
-    Returns:
-        refined_positions: list of (tile_y, tile_x, tile_size) per sequence index
-    """
+    
     n = len(path)
+
+    if face_bboxes is None:
+        face_bboxes = {}
+    if edge_scales is None:
+        edge_scales = {}
 
     # Compute common comparison size across all images in the path
     min_dim = inf
@@ -1321,6 +1400,14 @@ def refine_tile_positions(
         min_dim = min(min_dim, h, w)
     common_size = int(min_dim * min(tile_ratios))
     common_size = max(16, common_size)
+
+    # Precompute scaled face bboxes per sequence index using exact scale
+    scaled_face_bboxes = []
+    for k, idx in enumerate(path):
+        fn = filenames[idx]
+        bboxes = face_bboxes.get(fn, [])
+        sc = edge_scales.get(fn, 1.0)
+        scaled_face_bboxes.append(scale_bboxes(bboxes, sc))
 
     # Initialize positions from tile-aware solver results
     positions = []  # (ty, tx, ts) for each index in path order
@@ -1333,13 +1420,11 @@ def refine_tile_positions(
         if pos is not None:
             ty, tx, ts = pos
         else:
-            # Default to center at middle ratio
             mid_ratio = tile_ratios[len(tile_ratios) // 2]
             ts = int(min(h, w) * mid_ratio)
             ts = max(16, min(ts, h, w))
             ty, tx = (h - ts) // 2, (w - ts) // 2
 
-        # Clamp
         ty = max(0, min(ty, h - ts))
         tx = max(0, min(tx, w - ts))
         positions.append((ty, tx, ts))
@@ -1352,14 +1437,57 @@ def refine_tile_positions(
         ty, tx, ts = positions[seq_idx]
         return em[ty : ty + ts, tx : tx + ts]
 
+    def neighbor_cost(k, candidate_ty, candidate_tx, candidate_ts, neighbor_tiles, neighbor_indices):
+        """Compute total cost from a candidate position to all neighbors, including face bonus."""
+        cost = 0.0
+        for ni, nk in enumerate(neighbor_indices):
+            nt = neighbor_tiles[ni]
+            if nt.size == 0:
+                return inf
+
+            chamfer = _chamfer_cost_common(
+                edge_maps[filenames[path[k]]][candidate_ty : candidate_ty + candidate_ts,
+                                               candidate_tx : candidate_tx + candidate_ts],
+                nt, common_size
+            )
+
+            # Face alignment bonus
+            nty, ntx, nts = positions[nk]
+            bboxes_k = scaled_face_bboxes[k]
+            bboxes_n = scaled_face_bboxes[nk]
+            if bboxes_k and bboxes_n:
+                bonus = _face_alignment_bonus(
+                    candidate_ty, candidate_tx, candidate_ts,
+                    nty, ntx, nts,
+                    bboxes_k, bboxes_n
+                )
+                chamfer *= (1.0 - min(bonus, 0.9))
+
+            # Weight by distance: immediate neighbors full weight, lookback decays
+            dist = abs(k - nk)
+            weight = 0.5 ** (dist - 1) if dist > 1 else 1.0
+            cost += chamfer * weight
+
+        return cost
+
     def compute_total_cost():
-        """Compute total adjacent Chamfer cost for the current positions."""
+        """Compute total adjacent Chamfer cost with face bonuses and lookback."""
         total = 0.0
         for k in range(n - 1):
             t_a = get_tile(k)
             t_b = get_tile(k + 1)
             if t_a.size > 0 and t_b.size > 0:
-                total += _chamfer_cost_common(t_a, t_b, common_size)
+                chamfer = _chamfer_cost_common(t_a, t_b, common_size)
+                ay, ax, a_ts = positions[k]
+                by, bx, b_ts = positions[k + 1]
+                bboxes_a = scaled_face_bboxes[k]
+                bboxes_b = scaled_face_bboxes[k + 1]
+                if bboxes_a and bboxes_b:
+                    bonus = _face_alignment_bonus(
+                        ay, ax, a_ts, by, bx, b_ts, bboxes_a, bboxes_b
+                    )
+                    chamfer *= (1.0 - min(bonus, 0.9))
+                total += chamfer
         return total
 
     initial_cost = compute_total_cost()
@@ -1380,33 +1508,27 @@ def refine_tile_positions(
             h, w = em.shape
             cur_ty, cur_tx, cur_ts = positions[k]
 
-            # Determine which neighbors to consider
-            neighbors = []
-            if k > 0:
-                neighbors.append(k - 1)
-            if k < n - 1:
-                neighbors.append(k + 1)
+            # Collect neighbors: immediate + lookback
+            neighbor_indices = []
+            for offset in range(1, NUM_LOOKBACK + 1):
+                if k - offset >= 0:
+                    neighbor_indices.append(k - offset)
+                if k + offset < n:
+                    neighbor_indices.append(k + offset)
 
-            if not neighbors:
+            if not neighbor_indices:
                 continue
 
-            neighbor_tiles = [get_tile(nk) for nk in neighbors]
+            neighbor_tiles = [get_tile(nk) for nk in neighbor_indices]
 
             best_cost = inf
             best_pos = (cur_ty, cur_tx, cur_ts)
 
-            # Evaluate current position first
+            # Evaluate current position
             cur_tile = em[cur_ty : cur_ty + cur_ts, cur_tx : cur_tx + cur_ts]
             if cur_tile.shape[0] == cur_ts and cur_tile.shape[1] == cur_ts:
-                cur_cost = 0.0
-                valid = True
-                for nt in neighbor_tiles:
-                    if nt.size > 0:
-                        cur_cost += _chamfer_cost_common(cur_tile, nt, common_size)
-                    else:
-                        valid = False
-                        break
-                if valid:
+                cur_cost = neighbor_cost(k, cur_ty, cur_tx, cur_ts, neighbor_tiles, neighbor_indices)
+                if cur_cost < inf:
                     best_cost = cur_cost
                     best_pos = (cur_ty, cur_tx, cur_ts)
 
@@ -1416,15 +1538,12 @@ def refine_tile_positions(
                 if ts < 16 or ts > h or ts > w:
                     continue
 
-                # Scale refine_radius relative to the tile size ratio
-                # so we search proportionally
                 if cur_ts > 0:
                     scale_factor = ts / cur_ts
                 else:
                     scale_factor = 1.0
                 scaled_radius = max(1, int(refine_radius * scale_factor))
 
-                # Center of search: scale current position to this tile size
                 center_ty = max(0, min(int(cur_ty * scale_factor), h - ts))
                 center_tx = max(0, min(int(cur_tx * scale_factor), w - ts))
 
@@ -1445,20 +1564,7 @@ def refine_tile_positions(
                         if candidate.shape[0] != ts or candidate.shape[1] != ts:
                             continue
 
-                        cost = 0.0
-                        skip = False
-                        for nt in neighbor_tiles:
-                            if nt.size == 0:
-                                skip = True
-                                break
-                            c = _chamfer_cost_common(candidate, nt, common_size)
-                            cost += c
-                            if cost >= best_cost:
-                                skip = True
-                                break
-                        if skip:
-                            continue
-
+                        cost = neighbor_cost(k, ty, tx, ts, neighbor_tiles, neighbor_indices)
                         if cost < best_cost:
                             best_cost = cost
                             best_pos = (ty, tx, ts)
@@ -1483,7 +1589,6 @@ def refine_tile_positions(
 
     return positions
 
-
 # ── Main Sequencing Pipeline ────────────────────────────────────────────────
 
 
@@ -1496,7 +1601,7 @@ def sequence(
 ):
     cache_file = cache_file + cache_prefix + ".pkl"
     print("Step 1/5: Building edge maps...")
-    edge_maps = build_edge_maps(image_folder)
+    edge_maps, edge_scales = build_edge_maps(image_folder)
     n = len(edge_maps)
     print(f"  Found {n} images.\n")
 
@@ -1506,7 +1611,7 @@ def sequence(
 
     print(f"  Tile ratios: {TILE_RATIOS}")
 
-    if os.path.exists(cache_file):
+    if os.path.exists(cache_file) and cache_file != "new":
         print("Step 2/5: Loading cached cost data...")
         with open(cache_file, "rb") as f:
             cached = pickle.load(f)
@@ -1525,7 +1630,7 @@ def sequence(
                 fallback_cost_matrix,
                 coarse_dist,
             ) = build_sparse_cost_data(
-                edge_maps, max_workers=max_workers, image_folder=image_folder
+                edge_maps, edge_scales, max_workers=max_workers, image_folder=image_folder
             )
             with open(cache_file, "wb") as f:
                 pickle.dump(
@@ -1547,18 +1652,8 @@ def sequence(
             fallback_cost_matrix,
             coarse_dist,
         ) = build_sparse_cost_data(
-            edge_maps, max_workers=max_workers, image_folder=image_folder
+            edge_maps, edge_scales, max_workers=max_workers, image_folder=image_folder
         )
-        # with open(cache_file, "wb") as f:
-        #     pickle.dump(
-        #         {
-        #             "filenames": filenames,
-        #             "all_pair_costs": all_pair_costs,
-        #             "tile_positions_per_image": tile_positions_per_image,
-        #             "fallback_cost_matrix": fallback_cost_matrix,
-        #         },
-        #         f,
-        #     )
     print()
 
     print("Step 3/5: Tile-aware greedy nearest-neighbor path...")
@@ -1584,13 +1679,16 @@ def sequence(
         tile_positions,
         all_pair_costs,
         fallback_cost_matrix,
-        tile_positions_per_image,
+        tile_positions_per_image
     )
     print(f"  Optimized cost: {final_cost:.2f}\n")
 
     print("Step 5/5: Fine-grained tile position refinement...")
+    with open('face_bboxes.json') as f:
+        face_bboxes_refine = json.load(f)
     refined_positions = refine_tile_positions(
-        path, filenames, edge_maps, tile_positions
+        path, filenames, edge_maps, tile_positions,
+        edge_scales=edge_scales, face_bboxes=face_bboxes_refine
     )
     print()
 
@@ -1732,7 +1830,7 @@ def preview_edges(
         img_rgb = cv.cvtColor(img_bgr, cv.COLOR_BGR2RGB)
 
         # Edge map
-        edge_map = get_weighted_edges(path)
+        edge_map, _ = get_weighted_edges(path)
 
         # Count stats for the title
         nonzero_pct = 100.0 * np.count_nonzero(edge_map) / edge_map.size
