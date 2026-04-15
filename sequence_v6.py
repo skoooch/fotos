@@ -49,11 +49,12 @@ EDGE_THRESHOLD = 0.1
 MIN_EDGE_DENSITY = 0.01
 REFINE_STRIDE = 5  # fine-grained stride for tile refinement
 REFINE_RADIUS = 25  # search radius (pixels) around current tile position
-REFINE_ITERATIONS = 4  # number of forward+backward sweeps
+REFINE_ITERATIONS = 2  # number of forward+backward sweeps
 DISTANCE_METRIC = "embedding"  # "edge_descript", "embedding", or "combined"
 EMBEDDING_WEIGHT = 0.5  # weight for embedding distance in combined mode
 EDGE_METHOD = "hed"  # "hed", "scharr"
-NUM_LOOKBACK = 2
+NUM_LOOKBACK = 4
+LOOKBACK_EXP = 0.7
 FACE_ALIGN_WEIGHT = 0.3  # how much face alignment reduces cost (fraction of Chamfer)
 
 # ── Multi-signal cost weights ───────────────────────────────────────────────
@@ -1066,9 +1067,9 @@ def best_cost_for_arrival(
                     else:
                         tile_key_tail = (pos_j, pos_tail)
                     tail_cost_add = tail_pair_costs.get(tile_key_tail)
-                    tail_cost += (tail_cost_add if tail_cost_add is not None else fallback_cost_matrix[tail, j]) * (0.5**(tail_i + 1))
+                    tail_cost += (tail_cost_add if tail_cost_add is not None else fallback_cost_matrix[tail, j]) * (LOOKBACK_EXP**(tail_i + 1))
                 else:
-                    tail_cost += fallback_cost_matrix[tail, j] * (0.5**(tail_i + 1))
+                    tail_cost += fallback_cost_matrix[tail, j] * (LOOKBACK_EXP**(tail_i + 1))
         
         cost = base_cost + tail_cost
         if cost < best_cost:
@@ -1392,14 +1393,14 @@ def two_opt_tileaware(
                                     nb, idx,
                                     candidate_positions.get(nb), pos,
                                     all_pair_costs, fallback_cost_matrix,
-                                ) * (0.5 ** (offset - 1))
+                                ) * (LOOKBACK_EXP ** (offset - 1))
                             if k + offset < len(candidate):
                                 nb = candidate[k + offset]
                                 cost += lookup_cost(
                                     idx, nb,
                                     pos, candidate_positions.get(nb),
                                     all_pair_costs, fallback_cost_matrix,
-                                ) * (0.5 ** (offset - 1))
+                                ) * (LOOKBACK_EXP ** (offset - 1))
 
                         if cost < best_local_cost:
                             best_local_cost = cost
@@ -1685,7 +1686,7 @@ def refine_tile_positions(
 
 def sequence(
     image_folder,
-    output_file="sequence_order_v3.txt",
+    output_file="sequence_order_v3_4lookback.txt",
     cache_file="cost_matrix_cache",
     max_workers=None,
     cache_prefix="",
