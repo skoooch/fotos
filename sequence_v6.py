@@ -57,9 +57,9 @@ NUM_LOOKBACK = 2
 FACE_ALIGN_WEIGHT = 0.3  # how much face alignment reduces cost (fraction of Chamfer)
 
 # ── Multi-signal cost weights ───────────────────────────────────────────────
-CHAMFER_WEIGHT = 0.50     # edge structure continuity
-CLIP_WEIGHT = 0.30        # semantic continuity
-COLOR_WEIGHT = 0.20       # tonal/palette continuity
+CHAMFER_WEIGHT = 0.50  # edge structure continuity
+CLIP_WEIGHT = 0.30  # semantic continuity
+COLOR_WEIGHT = 0.20  # tonal/palette continuity
 
 PREPROCESSED_SEQS = []
 # ── Derived: list of tile ratios to test ─────────────────────────────────────
@@ -304,7 +304,7 @@ def get_weighted_edges(image_path, target_short_edge=TARGET_SHORT_EDGE):
       1. Threshold out low-confidence pixels
       2. Connected-component filtering to remove small fragments
       3. Gamma correction to further separate strong from weak
-    
+
     Returns:
         magnitude: float32 edge map
         scale: float, the scale factor from original image to edge map coords
@@ -321,7 +321,7 @@ def get_weighted_edges(image_path, target_short_edge=TARGET_SHORT_EDGE):
         img = cv.imread(image_path, cv.IMREAD_GRAYSCALE)
         h, w = img.shape
         scale = target_short_edge / min(h, w)
-        
+
     # ── Threshold out low-confidence edge pixels ──
     magnitude[magnitude < EDGE_THRESHOLD_LOW] = 0.0
 
@@ -397,20 +397,23 @@ def compute_image_features(filenames, image_folder):
     print(f"  CLIP embeddings shape: {embeddings.shape}")
     return embeddings.astype(np.float32)
 
-def compute_color_histograms(filenames, image_folder, target_short_edge=TARGET_SHORT_EDGE):
+
+def compute_color_histograms(
+    filenames, image_folder, target_short_edge=TARGET_SHORT_EDGE
+):
     """
     Compute per-image color histograms in LAB space for tonal similarity.
-    
+
     LAB is perceptually uniform, so histogram distance correlates with
     how different two images *look* in terms of color/tone.
-    
+
     Returns:
         np.ndarray of shape (n, num_bins * 3), L2-normalized
     """
     num_bins = 32
     histograms = []
     print(f"  Computing color histograms for {len(filenames)} images...")
-    
+
     for fn in filenames:
         path = os.path.join(image_folder, fn)
         try:
@@ -418,21 +421,23 @@ def compute_color_histograms(filenames, image_folder, target_short_edge=TARGET_S
             if img is None:
                 histograms.append(np.zeros(num_bins * 3, dtype=np.float32))
                 continue
-            
+
             h, w = img.shape[:2]
             scale = target_short_edge / min(h, w)
-            img = cv.resize(img, (int(w * scale), int(h * scale)), interpolation=cv.INTER_AREA)
-            
+            img = cv.resize(
+                img, (int(w * scale), int(h * scale)), interpolation=cv.INTER_AREA
+            )
+
             lab = cv.cvtColor(img, cv.COLOR_BGR2LAB)
-            
+
             hist = []
             # L channel: [0, 256]
             h_l = cv.calcHist([lab], [0], None, [num_bins], [0, 256]).flatten()
-            # A channel: [0, 256] 
+            # A channel: [0, 256]
             h_a = cv.calcHist([lab], [1], None, [num_bins], [0, 256]).flatten()
             # B channel: [0, 256]
             h_b = cv.calcHist([lab], [2], None, [num_bins], [0, 256]).flatten()
-            
+
             combined = np.concatenate([h_l, h_a, h_b]).astype(np.float32)
             norm = np.linalg.norm(combined)
             if norm > 0:
@@ -441,7 +446,7 @@ def compute_color_histograms(filenames, image_folder, target_short_edge=TARGET_S
         except Exception as e:
             print(f"    Color hist skip {fn}: {e}")
             histograms.append(np.zeros(num_bins * 3, dtype=np.float32))
-    
+
     return np.array(histograms, dtype=np.float32)
 
 
@@ -452,12 +457,12 @@ def compute_tile_color_histogram(img_bgr_tile, num_bins=32):
     """
     if img_bgr_tile is None or img_bgr_tile.size == 0:
         return np.zeros(num_bins * 3, dtype=np.float32)
-    
+
     lab = cv.cvtColor(img_bgr_tile, cv.COLOR_BGR2LAB)
     h_l = cv.calcHist([lab], [0], None, [num_bins], [0, 256]).flatten()
     h_a = cv.calcHist([lab], [1], None, [num_bins], [0, 256]).flatten()
     h_b = cv.calcHist([lab], [2], None, [num_bins], [0, 256]).flatten()
-    
+
     combined = np.concatenate([h_l, h_a, h_b]).astype(np.float32)
     norm = np.linalg.norm(combined)
     if norm > 0:
@@ -571,18 +576,25 @@ def get_tile_positions_for_image(edge_map, tile_ratios=TILE_RATIOS, stride=STRID
 def _face_alignment_bonus(ay, ax, a_ts, by, bx, b_ts, bboxes_a, bboxes_b):
     """
     Compute a cost reduction for face alignment between two tiles.
-    
+
     For each face in image A's tile, find the best-matching face in image B's tile.
     Measure how closely the face centers align (in normalized tile coordinates).
-    
+
     Returns:
         bonus: float >= 0. Higher = better alignment = more cost reduction.
                0 if no faces in either tile.
     """
+
     def faces_in_tile(bboxes, ty, tx, ts):
         results = []
         for bbox in bboxes:
-            fx, fy, fw, fh, conf = bbox["x"], bbox["y"], bbox["w"], bbox["h"], bbox["confidence"]
+            fx, fy, fw, fh, conf = (
+                bbox["x"],
+                bbox["y"],
+                bbox["w"],
+                bbox["h"],
+                bbox["confidence"],
+            )
             fcx = fx + fw / 2.0
             fcy = fy + fh / 2.0
             if ty <= fcy <= ty + ts and tx <= fcx <= tx + ts:
@@ -598,11 +610,11 @@ def _face_alignment_bonus(ay, ax, a_ts, by, bx, b_ts, bboxes_a, bboxes_b):
     total_align = 0.0
     matched = 0
 
-    for (cxa, cya, sa, conf_a) in faces_a:
+    for cxa, cya, sa, conf_a in faces_a:
         best_dist = inf
         best_size_match = 0.0
         best_conf_weight = 0.0
-        for (cxb, cyb, sb, conf_b) in faces_b:
+        for cxb, cyb, sb, conf_b in faces_b:
             # Raw positional distance (confidence applied to the BONUS, not the distance)
             dist = np.sqrt((cxa - cxb) ** 2 + (cya - cyb) ** 2)
             if dist < best_dist:
@@ -628,29 +640,48 @@ def _face_alignment_bonus(ay, ax, a_ts, by, bx, b_ts, bboxes_a, bboxes_b):
 
     return total_align * FACE_ALIGN_WEIGHT
 
+
 # Scale face bboxes from original image coords to edge map coords
 def scale_bboxes(bboxes, scale):
     """Scale face bboxes from original image coords to edge map coords."""
     if not bboxes:
         return []
-    return [{"x": b["x"]*scale, "y": b["y"]*scale,
-             "w": b["w"]*scale, "h": b["h"]*scale,
-             "confidence": b.get("confidence", 1.0)} for b in bboxes]
+    return [
+        {
+            "x": b["x"] * scale,
+            "y": b["y"] * scale,
+            "w": b["w"] * scale,
+            "h": b["h"] * scale,
+            "confidence": b.get("confidence", 1.0),
+        }
+        for b in bboxes
+    ]
 
-def find_all_tile_pair_costs(edge_a, edge_b, bboxes_i, bboxes_j, scale_i, scale_j,
-                              clip_dist_ij=0.0, img_path_a=None, img_path_b=None,
-                              tile_ratios=TILE_RATIOS, stride=STRIDE):
+
+def find_all_tile_pair_costs(
+    edge_a,
+    edge_b,
+    bboxes_i,
+    bboxes_j,
+    scale_i,
+    scale_j,
+    clip_dist_ij=0.0,
+    img_path_a=None,
+    img_path_b=None,
+    tile_ratios=TILE_RATIOS,
+    stride=STRIDE,
+):
     """
     Compute multi-signal cost for ALL valid tile position combinations.
-    
+
     Cost = CHAMFER_WEIGHT * chamfer (edge continuity)
-         + CLIP_WEIGHT * clip_dist (semantic continuity, same for all tiles of this pair)  
+         + CLIP_WEIGHT * clip_dist (semantic continuity, same for all tiles of this pair)
          + COLOR_WEIGHT * color_dist (tonal continuity, per tile pair)
          - face alignment bonus (multiplicative reduction)
     """
     h_a, w_a = edge_a.shape
     h_b, w_b = edge_b.shape
-    
+
     min_dim = min(h_a, w_a, h_b, w_b)
     common_size = int(min_dim * min(tile_ratios))
     if common_size < 16:
@@ -672,11 +703,11 @@ def find_all_tile_pair_costs(edge_a, edge_b, bboxes_i, bboxes_j, scale_i, scale_
     # Load full images for color histogram computation (once per pair)
     img_bgr_a = cv.imread(img_path_a) if img_path_a else None
     img_bgr_b = cv.imread(img_path_b) if img_path_b else None
-    
+
     # Precompute color histograms for all tile positions
     color_hists_a = {}
     color_hists_b = {}
-    
+
     if img_bgr_a is not None and COLOR_WEIGHT > 0:
         actual_h_a, actual_w_a = img_bgr_a.shape[:2]
         inv_scale_a = 1.0 / scale_i
@@ -689,11 +720,11 @@ def find_all_tile_pair_costs(edge_a, edge_b, bboxes_i, bboxes_j, scale_i, scale_
             oa_ts = max(16, min(oa_ts, actual_h_a, actual_w_a))
             oa_y = max(0, min(oa_y, actual_h_a - oa_ts))
             oa_x = max(0, min(oa_x, actual_w_a - oa_ts))
-            crop = img_bgr_a[oa_y:oa_y + oa_ts, oa_x:oa_x + oa_ts]
+            crop = img_bgr_a[oa_y : oa_y + oa_ts, oa_x : oa_x + oa_ts]
             # Resize to consistent size for histogram comparison
             crop = cv.resize(crop, (128, 128), interpolation=cv.INTER_AREA)
             color_hists_a[key] = compute_tile_color_histogram(crop)
-    
+
     if img_bgr_b is not None and COLOR_WEIGHT > 0:
         actual_h_b, actual_w_b = img_bgr_b.shape[:2]
         inv_scale_b = 1.0 / scale_j
@@ -705,7 +736,7 @@ def find_all_tile_pair_costs(edge_a, edge_b, bboxes_i, bboxes_j, scale_i, scale_
             ob_ts = max(16, min(ob_ts, actual_h_b, actual_w_b))
             ob_y = max(0, min(ob_y, actual_h_b - ob_ts))
             ob_x = max(0, min(ob_x, actual_w_b - ob_ts))
-            crop = img_bgr_b[ob_y:ob_y + ob_ts, ob_x:ob_x + ob_ts]
+            crop = img_bgr_b[ob_y : ob_y + ob_ts, ob_x : ob_x + ob_ts]
             crop = cv.resize(crop, (128, 128), interpolation=cv.INTER_AREA)
             color_hists_b[key] = compute_tile_color_histogram(crop)
 
@@ -716,7 +747,7 @@ def find_all_tile_pair_costs(edge_a, edge_b, bboxes_i, bboxes_j, scale_i, scale_
 
     for ay, ax, a_ts, mask_a, weights_a, sum_wa, dt_a in tiles_a:
         hist_a = color_hists_a.get((ay, ax, a_ts))
-        
+
         for by, bx, b_ts, mask_b, weights_b, sum_wb, dt_b in tiles_b:
             # Signal 1: Chamfer distance (edge structure continuity)
             d_ab = np.sum(weights_a * dt_b[mask_a]) / sum_wa
@@ -734,22 +765,24 @@ def find_all_tile_pair_costs(edge_a, edge_b, bboxes_i, bboxes_j, scale_i, scale_
                 # Cosine distance between normalized histograms: [0, 2]
                 dot = np.dot(hist_a, hist_b)
                 color_dist = 1.0 - dot  # [0, 2], typically [0, 1]
-            
+
             # Combine signals (normalize chamfer to similar scale as others)
             # Chamfer is in pixels (~0-50 range), CLIP/color are in [0, 2]
             # We normalize chamfer by dividing by common_size to get ~[0, 1]
             chamfer_norm = chamfer / max(common_size, 1)
-            
-            cost = (CHAMFER_WEIGHT * chamfer_norm
-                    + CLIP_WEIGHT * clip_term
-                    + COLOR_WEIGHT * color_dist)
+
+            cost = (
+                CHAMFER_WEIGHT * chamfer_norm
+                + CLIP_WEIGHT * clip_term
+                + COLOR_WEIGHT * color_dist
+            )
 
             # Face alignment bonus (multiplicative reduction on combined cost)
             if has_faces:
                 bonus = _face_alignment_bonus(
                     ay, ax, a_ts, by, bx, b_ts, scaled_a, scaled_b
                 )
-                cost *= (1.0 - min(bonus, 0.9))
+                cost *= 1.0 - min(bonus, 0.9)
 
             costs[((ay, ax, a_ts), (by, bx, b_ts))] = cost
             if cost < best_cost:
@@ -762,20 +795,40 @@ def find_all_tile_pair_costs(edge_a, edge_b, bboxes_i, bboxes_j, scale_i, scale_
 
 def _compute_all_pairs(args):
     """Worker for parallel all-tile-pair matching."""
-    i, j, edge_i, edge_j, bboxes_i, bboxes_j, scale_i, scale_j, clip_dist_ij, path_i, path_j = args
+    (
+        i,
+        j,
+        edge_i,
+        edge_j,
+        bboxes_i,
+        bboxes_j,
+        scale_i,
+        scale_j,
+        clip_dist_ij,
+        path_i,
+        path_j,
+    ) = args
     costs, best_cost, pos_a, pos_b = find_all_tile_pair_costs(
-        edge_i, edge_j, bboxes_i, bboxes_j, scale_i, scale_j,
-        clip_dist_ij=clip_dist_ij, img_path_a=path_i, img_path_b=path_j
+        edge_i,
+        edge_j,
+        bboxes_i,
+        bboxes_j,
+        scale_i,
+        scale_j,
+        clip_dist_ij=clip_dist_ij,
+        img_path_a=path_i,
+        img_path_b=path_j,
     )
     return i, j, costs, best_cost, pos_a, pos_b
+
 
 # ── Pairwise Cost Matrix (Sparse, KNN-based) ───────────────────────────────
 
 
 def build_edge_maps(image_folder, extensions=(".jpg", ".jpeg", ".png", ".tif", ".bmp")):
     """Load all images from a folder and compute weighted edge maps."""
-    edge_maps = {}   # fn -> edge_map (float32)
-    edge_scales = {} # fn -> scale factor (float)
+    edge_maps = {}  # fn -> edge_map (float32)
+    edge_scales = {}  # fn -> scale factor (float)
     for fn in sorted(os.listdir(image_folder)):
         if os.path.splitext(fn)[1].lower() in extensions:
             path = os.path.join(image_folder, fn)
@@ -787,37 +840,74 @@ def build_edge_maps(image_folder, extensions=(".jpg", ".jpeg", ".png", ".tif", "
             except Exception as e:
                 print(f"  SKIP {fn}: {e}")
         elif "seq" in fn and os.path.isdir(os.path.join(image_folder, fn)):
-            seq_dir = os.listdir(os.path.join(image_folder, fn))
+            seq_dir_path = os.path.join(image_folder, fn)
+            seq_files = os.listdir(seq_dir_path)
             first_last = []
-            seq_path = os.path.join(image_folder, fn, "sequence.txt")
+            seq_path = os.path.join(seq_dir_path, "sequence.txt")
             if not os.path.exists(seq_path):
-                with open(seq_path, "w") as f:
-                    for file in seq_dir:
+                # Auto-generate sequence file for the sub-folder
+                with open(seq_path, "w") as sf:
+                    for file in sorted(seq_files):
                         if os.path.splitext(file)[1].lower() in extensions:
-                            with Image.open(file) as img:
-                                width, height = img.size
-                                ts = min(width,height)
-                                if width > height:
-                                    f.write(f"{fn},{0},{(width - ts) //2},{ts},{height},{width}\n")
-                                else:
-                                    f.write(f"{fn},{(height - ts) // 2},{0},{ts},{height},{width}\n")
-            with open(seq_path, "r") as f:
-                cleaned = [line for line in f if line.strip()]
+                            file_path = os.path.join(seq_dir_path, file)
+                            try:
+                                with Image.open(file_path) as img:
+                                    width, height = img.size
+                                    ts = min(width, height)
+                                    if width > height:
+                                        sf.write(
+                                            f"{file},{0},{(width - ts) // 2},{ts},{height},{width}\n"
+                                        )
+                                    else:
+                                        sf.write(
+                                            f"{file},{(height - ts) // 2},{0},{ts},{height},{width}\n"
+                                        )
+                            except Exception as e:
+                                print(f"  SKIP sub-seq file {file}: {e}")
+            with open(seq_path, "r") as sf:
+                cleaned = [line for line in sf if line.strip()]
+            if len(cleaned) >= 2:
                 for line in [cleaned[0], cleaned[-1]]:
                     line = line.strip()
                     if not line:
                         continue
                     parts = line.split(",")
                     sq_fn = parts[0]
-                    sq_em, sq_sc = get_weighted_edges(path)
-                    edge_maps[sq_fn] = sq_em
-                    edge_scales[sq_fn] = sq_sc
-                    tile_y, tile_x = int(parts[1]), int(parts[2])
-                    tile_size_ld = int(parts[3])
-                    ld_h, ld_w = int(parts[4]), int(parts[5])
-                    first_last.append((sq_fn, tile_y, tile_x, tile_size_ld, ld_h, ld_w))
-            PREPROCESSED_SEQS.append((fn, tuple(first_last)))
+                    sq_file_path = os.path.join(seq_dir_path, sq_fn)
+                    if not os.path.exists(sq_file_path):
+                        print(f"  SKIP sub-seq image (not found): {sq_file_path}")
+                        continue
+                    try:
+                        sq_em, sq_sc = get_weighted_edges(sq_file_path)
+                        # Store with folder-qualified name to avoid collisions
+                        qualified_fn = os.path.join(fn, sq_fn)
+                        edge_maps[qualified_fn] = sq_em
+                        edge_scales[qualified_fn] = sq_sc
+                        tile_y, tile_x = int(parts[1]), int(parts[2])
+                        tile_size_ld = int(parts[3])
+                        ld_h, ld_w = int(parts[4]), int(parts[5])
+                        first_last.append(
+                            (qualified_fn, tile_y, tile_x, tile_size_ld, ld_h, ld_w)
+                        )
+                        print(
+                            f"  sub-seq edge: {qualified_fn}  shape={sq_em.shape}  "
+                            f"tile=({tile_y},{tile_x},{tile_size_ld})"
+                        )
+                    except Exception as e:
+                        print(f"  SKIP sub-seq {sq_fn}: {e}")
+            if len(first_last) == 2:
+                PREPROCESSED_SEQS.append((fn, tuple(first_last)))
+                print(
+                    f"  Registered pre-sequenced group: {fn} "
+                    f"({first_last[0][0]} → {first_last[1][0]})"
+                )
+            elif len(first_last) == 1:
+                # Single-image sub-sequence — just treat as a regular image
+                print(f"  Sub-sequence {fn} has only 1 image, treating as regular.")
+            else:
+                print(f"  Sub-sequence {fn} has no valid images, skipping.")
     return edge_maps, edge_scales
+
 
 def build_knn_shortlist(
     edge_maps, k=K_NEIGHBORS, distance_metric=DISTANCE_METRIC, image_folder=None
@@ -872,6 +962,7 @@ def build_knn_shortlist(
 
     return filenames, symmetric_pairs, neighbors, dist_matrix, clip_embeddings
 
+
 def build_sparse_cost_data(
     edge_maps, edge_scales, max_workers=None, k=K_NEIGHBORS, image_folder=None
 ):
@@ -880,22 +971,95 @@ def build_sparse_cost_data(
     2. Run expensive ALL tile-pair matching on shortlisted pairs (multi-ratio).
     3. Compute fallback costs for non-shortlisted pairs.
     """
-    filenames, shortlisted_pairs, neighbors, coarse_dist, clip_embeddings = build_knn_shortlist(
-        edge_maps, k=k, image_folder=image_folder
+    filenames, shortlisted_pairs, neighbors, coarse_dist, clip_embeddings = (
+        build_knn_shortlist(edge_maps, k=k, image_folder=image_folder)
     )
-    
+
+    # Build index mapping for preprocessed sequences
+    fn_to_idx = {fn: i for i, fn in enumerate(filenames)}
+    forced_edges = []  # list of (first_idx, last_idx, first_pos, last_pos)
+    forced_edge_set = set()  # set of (first_idx, last_idx) for quick lookup
+
+    for seq_name, (first_info, last_info) in PREPROCESSED_SEQS:
+        first_fn, f_ty, f_tx, f_ts, f_h, f_w = first_info
+        last_fn, l_ty, l_tx, l_ts, l_h, l_w = last_info
+
+        first_idx = fn_to_idx.get(first_fn)
+        last_idx = fn_to_idx.get(last_fn)
+
+        if first_idx is None or last_idx is None:
+            print(
+                f"  WARNING: sub-seq {seq_name} endpoints not in filenames, skipping. "
+                f"first={first_fn} ({first_idx}), last={last_fn} ({last_idx})"
+            )
+            continue
+
+        # Convert tile positions from sequence-file space (ld_h, ld_w) to edge-map space
+        # The edge map is at TARGET_SHORT_EDGE scale; the sequence file stores at (ld_h, ld_w)
+        em_first = edge_maps[first_fn]
+        em_last = edge_maps[last_fn]
+        em_fh, em_fw = em_first.shape
+        em_lh, em_lw = em_last.shape
+
+        # Scale from sequence-file coords to edge-map coords
+        f_scale = em_fh / f_h if f_h > 0 else 1.0
+        l_scale = em_lh / l_h if l_h > 0 else 1.0
+
+        first_pos = (
+            int(f_ty * f_scale),
+            int(f_tx * f_scale),
+            int(f_ts * f_scale),
+        )
+        last_pos = (
+            int(l_ty * l_scale),
+            int(l_tx * l_scale),
+            int(l_ts * l_scale),
+        )
+
+        # Clamp to valid range
+        first_pos = (
+            max(0, min(first_pos[0], em_fh - first_pos[2])),
+            max(0, min(first_pos[1], em_fw - first_pos[2])),
+            max(16, min(first_pos[2], em_fh, em_fw)),
+        )
+        last_pos = (
+            max(0, min(last_pos[0], em_lh - last_pos[2])),
+            max(0, min(last_pos[1], em_lw - last_pos[2])),
+            max(16, min(last_pos[2], em_lh, em_lw)),
+        )
+
+        forced_edges.append((first_idx, last_idx, first_pos, last_pos))
+        forced_edge_set.add((first_idx, last_idx))
+
+        # Ensure this pair is shortlisted for tile-pair cost computation
+        pair_key = (min(first_idx, last_idx), max(first_idx, last_idx))
+        shortlisted_pairs.add(pair_key)
+
+        # Also ensure neighbors of first/last include each other
+        if last_idx not in neighbors.get(first_idx, []):
+            neighbors.setdefault(first_idx, []).append(last_idx)
+        if first_idx not in neighbors.get(last_idx, []):
+            neighbors.setdefault(last_idx, []).append(first_idx)
+
+        print(
+            f"  Forced edge: {first_fn}[{first_idx}] → {last_fn}[{last_idx}] "
+            f"(seq: {seq_name})"
+        )
+
     # Precompute pairwise CLIP distances for shortlisted pairs
     clip_dist_cache = {}
     if clip_embeddings is not None:
         for i, j in shortlisted_pairs:
             # Cosine distance: 1 - dot(a, b) for L2-normalized vectors
-            clip_dist_cache[(i, j)] = float(1.0 - np.dot(clip_embeddings[i], clip_embeddings[j]))
-    
+            clip_dist_cache[(i, j)] = float(
+                1.0 - np.dot(clip_embeddings[i], clip_embeddings[j])
+            )
+
     _unload_clip_model()
     n = len(filenames)
-    with open('face_bboxes.json') as f:
+    with open("face_bboxes.json") as f:
         face_bboxes = json.load(f)
-    
+
     all_pair_costs = {}
     best_costs = {}
 
@@ -904,13 +1068,44 @@ def build_sparse_cost_data(
         positions = get_tile_positions_for_image(edge_maps[fn])
         tile_positions_per_image[idx] = positions
 
+    # For forced-edge endpoints, ensure their locked tile position is in the
+    # valid positions list (so the solver can find it)
+    for first_idx, last_idx, first_pos, last_pos in forced_edges:
+        if first_pos not in tile_positions_per_image.get(first_idx, []):
+            tile_positions_per_image.setdefault(first_idx, []).append(first_pos)
+        if last_pos not in tile_positions_per_image.get(last_idx, []):
+            tile_positions_per_image.setdefault(last_idx, []).append(last_pos)
+
+    # Resolve image_folder for sub-sequence images
+    def _resolve_image_path(fn):
+        """Resolve a filename to its full path, handling sub-folder qualified names."""
+        if image_folder is None:
+            return None
+        # For qualified names like "seq_folder/image.jpg"
+        full_path = os.path.join(image_folder, fn)
+        if os.path.exists(full_path):
+            return full_path
+        # Try without qualification
+        base = os.path.basename(fn)
+        fallback = os.path.join(image_folder, base)
+        if os.path.exists(fallback):
+            return fallback
+        return full_path  # return anyway, let downstream handle missing
+
     tasks = [
-        (i, j, edge_maps[filenames[i]], edge_maps[filenames[j]],
-         face_bboxes.get(filenames[i], []), face_bboxes.get(filenames[j], []),
-         edge_scales[filenames[i]], edge_scales[filenames[j]],
-         clip_dist_cache.get((i, j), 0.5),
-         os.path.join(image_folder, filenames[i]) if image_folder else None,
-         os.path.join(image_folder, filenames[j]) if image_folder else None)
+        (
+            i,
+            j,
+            edge_maps[filenames[i]],
+            edge_maps[filenames[j]],
+            face_bboxes.get(filenames[i], []),
+            face_bboxes.get(filenames[j], []),
+            edge_scales[filenames[i]],
+            edge_scales[filenames[j]],
+            clip_dist_cache.get((i, j), 0.5),
+            _resolve_image_path(filenames[i]),
+            _resolve_image_path(filenames[j]),
+        )
         for i, j in shortlisted_pairs
     ]
 
@@ -919,10 +1114,14 @@ def build_sparse_cost_data(
         f"  All-tile-pair matching {total} shortlisted pairs (of {n*(n-1)//2} total)..."
     )
     print(f"  Tile ratios: {TILE_RATIOS}")
-    print(f"  Cost weights: chamfer={CHAMFER_WEIGHT}, clip={CLIP_WEIGHT}, color={COLOR_WEIGHT}")
+    print(
+        f"  Cost weights: chamfer={CHAMFER_WEIGHT}, clip={CLIP_WEIGHT}, color={COLOR_WEIGHT}"
+    )
     print(
         f"  Avg tile positions per image: {np.mean([len(v) for v in tile_positions_per_image.values()]):.1f}"
     )
+    if forced_edges:
+        print(f"  Forced edges (pre-sequenced): {len(forced_edges)}")
 
     done = 0
     if max_workers is None:
@@ -980,7 +1179,9 @@ def build_sparse_cost_data(
         tile_positions_per_image,
         fallback_cost_matrix,
         coarse_dist,
+        forced_edges,
     )
+
 
 # ── Tile-Aware Cost Lookup ──────────────────────────────────────────────────
 
@@ -1049,11 +1250,11 @@ def best_cost_for_arrival(
             tile_key = (pos_i, pos_j)
         else:
             tile_key = (pos_j, pos_i)
-        
+
         base_cost = pair_costs.get(tile_key)
         if base_cost is None:
             continue
-        
+
         tail_cost = 0
         for tail_i, pos_tail_tuple in enumerate(pos_tails):
             if pos_tail_tuple is not None:
@@ -1066,10 +1267,14 @@ def best_cost_for_arrival(
                     else:
                         tile_key_tail = (pos_j, pos_tail)
                     tail_cost_add = tail_pair_costs.get(tile_key_tail)
-                    tail_cost += (tail_cost_add if tail_cost_add is not None else fallback_cost_matrix[tail, j]) * (0.5**(tail_i + 1))
+                    tail_cost += (
+                        tail_cost_add
+                        if tail_cost_add is not None
+                        else fallback_cost_matrix[tail, j]
+                    ) * (0.5 ** (tail_i + 1))
                 else:
-                    tail_cost += fallback_cost_matrix[tail, j] * (0.5**(tail_i + 1))
-        
+                    tail_cost += fallback_cost_matrix[tail, j] * (0.5 ** (tail_i + 1))
+
         cost = base_cost + tail_cost
         if cost < best_cost:
             best_cost = cost
@@ -1115,26 +1320,40 @@ def greedy_nearest_neighbor_tileaware(
     all_pair_costs,
     fallback_cost_matrix,
     tile_positions_per_image,
+    forced_edges=None,
 ):
     """
     Nearest-neighbor heuristic that tracks each image's current tile position.
     Tile positions are (y, x, tile_size) tuples.
 
-    When we move from image `current` to `next`:
-      - If `current` already has a locked tile position, we find the best
-        position for `next` given that constraint.
-      - If `current` has no locked position (it's the start), we pick the
-        pair (pos_current, pos_next) that minimizes cost.
+    Forced edges: when we visit a forced-edge start node (first_idx), the
+    next node MUST be the corresponding last_idx, using the locked tile
+    positions from the sub-sequence file.
 
     Returns:
         best_path: list of image indices
         best_total: float total cost
         best_positions: dict image_idx -> (ty, tx, tile_size)
     """
+    if forced_edges is None:
+        forced_edges = []
+
+    # Build lookup: first_idx -> (last_idx, first_pos, last_pos)
+    forced_map = {}
+    # Also build reverse: last_idx -> first_idx (so we never start from a last node
+    # without its first node)
+    forced_last_to_first = {}
+    locked_positions = {}  # idx -> pos (locked tile positions for forced endpoints)
+
+    for first_idx, last_idx, first_pos, last_pos in forced_edges:
+        forced_map[first_idx] = (last_idx, first_pos, last_pos)
+        forced_last_to_first[last_idx] = first_idx
+        locked_positions[first_idx] = first_pos
+        locked_positions[last_idx] = last_pos
+
     best_path = None
     best_total = inf
     best_positions = None
-    
 
     rng = np.random.default_rng(42)
     num_starts = min(50, n) if n > 200 else n
@@ -1142,6 +1361,12 @@ def greedy_nearest_neighbor_tileaware(
 
     for si, start in enumerate(start_nodes):
         start = int(start)
+
+        # Don't start from a forced-edge "last" node — we'd need its "first" before it
+        if start in forced_last_to_first:
+            # Start from its first instead
+            start = forced_last_to_first[start]
+
         visited = {start}
         path = [start]
         total = 0.0
@@ -1149,7 +1374,31 @@ def greedy_nearest_neighbor_tileaware(
         cur_positions = {}  # image_idx -> (ty, tx, tile_size)
         pos_tails = [None for i in range(NUM_LOOKBACK)]
 
-        for _ in range(n - 1):
+        # Apply locked position for start if it's a forced endpoint
+        if start in locked_positions:
+            cur_positions[start] = locked_positions[start]
+
+        # If start is a forced-edge first, immediately add the last
+        if start in forced_map:
+            last_idx, first_pos, last_pos = forced_map[start]
+            cur_positions[start] = first_pos
+            cur_positions[last_idx] = last_pos
+            # Cost of this forced edge
+            cost = lookup_cost(
+                start,
+                last_idx,
+                first_pos,
+                last_pos,
+                all_pair_costs,
+                fallback_cost_matrix,
+            )
+            total += cost
+            path.append(last_idx)
+            visited.add(last_idx)
+            pos_tails[0] = (start, first_pos)
+            current = last_idx
+
+        for _ in range(n - len(visited)):
             best_nxt = None
             best_nxt_cost = inf
             best_nxt_pos_cur = None
@@ -1161,32 +1410,75 @@ def greedy_nearest_neighbor_tileaware(
                 if j in visited:
                     continue
 
+                # Skip forced-edge "last" nodes — they can only be reached
+                # via their "first" node
+                if j in forced_last_to_first and forced_last_to_first[j] not in visited:
+                    continue
+
                 if cur_pos is not None:
-                    # Current image has locked position — find best pos for j
-                    cost, pos_j = best_cost_for_arrival(
-                        current,
-                        j,
-                        cur_pos,
-                        all_pair_costs,
-                        fallback_cost_matrix,
-                        tile_positions_per_image.get(j, []),
-                        pos_tails
-                    )
-                    if cost < best_nxt_cost:
-                        best_nxt_cost = cost
-                        best_nxt = j
-                        best_nxt_pos_cur = cur_pos
-                        best_nxt_pos_nxt = pos_j
+                    # If j has a locked position (forced endpoint), use it
+                    if j in locked_positions:
+                        pos_j = locked_positions[j]
+                        cost = lookup_cost(
+                            current,
+                            j,
+                            cur_pos,
+                            pos_j,
+                            all_pair_costs,
+                            fallback_cost_matrix,
+                        )
+                        if cost < best_nxt_cost:
+                            best_nxt_cost = cost
+                            best_nxt = j
+                            best_nxt_pos_cur = cur_pos
+                            best_nxt_pos_nxt = pos_j
+                    else:
+                        cost, pos_j = best_cost_for_arrival(
+                            current,
+                            j,
+                            cur_pos,
+                            all_pair_costs,
+                            fallback_cost_matrix,
+                            tile_positions_per_image.get(j, []),
+                            pos_tails,
+                        )
+                        if cost < best_nxt_cost:
+                            best_nxt_cost = cost
+                            best_nxt = j
+                            best_nxt_pos_cur = cur_pos
+                            best_nxt_pos_nxt = pos_j
                 else:
-                    # Current has no locked position — find best pair
-                    cost, pos_c, pos_j = best_cost_any_pos(
-                        current, j, all_pair_costs, fallback_cost_matrix
-                    )
-                    if cost < best_nxt_cost:
-                        best_nxt_cost = cost
-                        best_nxt = j
-                        best_nxt_pos_cur = pos_c
-                        best_nxt_pos_nxt = pos_j
+                    if j in locked_positions:
+                        pos_j = locked_positions[j]
+                        # Find best pos for current given j is locked
+                        best_pair_cost = inf
+                        best_pair_pos_c = None
+                        for pos_c in tile_positions_per_image.get(current, []):
+                            c = lookup_cost(
+                                current,
+                                j,
+                                pos_c,
+                                pos_j,
+                                all_pair_costs,
+                                fallback_cost_matrix,
+                            )
+                            if c < best_pair_cost:
+                                best_pair_cost = c
+                                best_pair_pos_c = pos_c
+                        if best_pair_cost < best_nxt_cost:
+                            best_nxt_cost = best_pair_cost
+                            best_nxt = j
+                            best_nxt_pos_cur = best_pair_pos_c
+                            best_nxt_pos_nxt = pos_j
+                    else:
+                        cost, pos_c, pos_j = best_cost_any_pos(
+                            current, j, all_pair_costs, fallback_cost_matrix
+                        )
+                        if cost < best_nxt_cost:
+                            best_nxt_cost = cost
+                            best_nxt = j
+                            best_nxt_pos_cur = pos_c
+                            best_nxt_pos_nxt = pos_j
 
             if best_nxt is None:
                 break
@@ -1197,12 +1489,34 @@ def greedy_nearest_neighbor_tileaware(
             if best_nxt_pos_nxt is not None:
                 cur_positions[best_nxt] = best_nxt_pos_nxt
             for lookback_i in range(NUM_LOOKBACK - 1, 0, -1):
-                pos_tails[lookback_i] = pos_tails[lookback_i-1]
+                pos_tails[lookback_i] = pos_tails[lookback_i - 1]
             pos_tails[0] = (current, best_nxt_pos_cur)
             total += best_nxt_cost
             path.append(best_nxt)
             visited.add(best_nxt)
             current = best_nxt
+
+            # If we just arrived at a forced-edge first node, immediately
+            # traverse to its last node
+            if current in forced_map and forced_map[current][0] not in visited:
+                last_idx, first_pos, last_pos = forced_map[current]
+                cur_positions[current] = first_pos
+                cur_positions[last_idx] = last_pos
+                cost = lookup_cost(
+                    current,
+                    last_idx,
+                    first_pos,
+                    last_pos,
+                    all_pair_costs,
+                    fallback_cost_matrix,
+                )
+                total += cost
+                for lookback_i in range(NUM_LOOKBACK - 1, 0, -1):
+                    pos_tails[lookback_i] = pos_tails[lookback_i - 1]
+                pos_tails[0] = (current, first_pos)
+                path.append(last_idx)
+                visited.add(last_idx)
+                current = last_idx
 
         if total < best_total:
             best_total = total
@@ -1218,11 +1532,7 @@ def greedy_nearest_neighbor_tileaware(
 
 
 def _optimize_positions_for_path(
-    path,
-    positions,
-    all_pair_costs,
-    fallback_cost_matrix,
-    tile_positions_per_image
+    path, positions, all_pair_costs, fallback_cost_matrix, tile_positions_per_image
 ):
     """
     Given a fixed path ordering, optimize tile positions for each image
@@ -1261,7 +1571,7 @@ def _optimize_positions_for_path(
                         prev_pos,
                         pos,
                         all_pair_costs,
-                        fallback_cost_matrix
+                        fallback_cost_matrix,
                     )
                 if next_idx is not None:
                     next_pos = positions.get(next_idx)
@@ -1271,7 +1581,7 @@ def _optimize_positions_for_path(
                         pos,
                         next_pos,
                         all_pair_costs,
-                        fallback_cost_matrix
+                        fallback_cost_matrix,
                     )
                 if cost < best_cost:
                     best_cost = cost
@@ -1290,7 +1600,7 @@ def _optimize_positions_for_path(
             positions.get(i),
             positions.get(j),
             all_pair_costs,
-            fallback_cost_matrix
+            fallback_cost_matrix,
         )
     return total
 
@@ -1318,11 +1628,38 @@ def two_opt_tileaware(
     fallback_cost_matrix,
     tile_positions_per_image,
     max_iterations=NUM_2OPT_ITERATIONS,
+    forced_edges=None,
 ):
     """
     Improve a path by repeatedly reversing sub-segments, with tile-position
     awareness and NUM_LOOKBACK cost evaluation.
+
+    Forced edges are never broken: if a reversal would separate a forced
+    first→last pair or reverse their order, it is skipped.
     """
+    if forced_edges is None:
+        forced_edges = []
+
+    # Build set of forced (first, last) pairs and locked positions
+    forced_pairs = set()
+    locked_positions = {}
+    for first_idx, last_idx, first_pos, last_pos in forced_edges:
+        forced_pairs.add((first_idx, last_idx))
+        locked_positions[first_idx] = first_pos
+        locked_positions[last_idx] = last_pos
+
+    def _violates_forced_edges(candidate_path):
+        """Check if a candidate path breaks any forced edge constraints."""
+        for first_idx, last_idx in forced_pairs:
+            try:
+                fi = candidate_path.index(first_idx)
+                li = candidate_path.index(last_idx)
+            except ValueError:
+                return True  # missing node
+            if li != fi + 1:
+                return True  # must be immediately adjacent, first before last
+        return False
+
     best = path[:]
     best_positions = dict(positions)
     best_cost = _path_cost_tileaware(
@@ -1330,15 +1667,18 @@ def two_opt_tileaware(
     )
 
     def _window_cost(p, pos, start, end):
-        """Cost of edges in p[start..end], i.e. sum of p[k]->p[k+1] for k in [start, end)."""
+        """Cost of edges in p[start..end]."""
         c = 0.0
         for k in range(start, end):
             if k < 0 or k + 1 >= len(p):
                 continue
             c += lookup_cost(
-                p[k], p[k + 1],
-                pos.get(p[k]), pos.get(p[k + 1]),
-                all_pair_costs, fallback_cost_matrix,
+                p[k],
+                p[k + 1],
+                pos.get(p[k]),
+                pos.get(p[k + 1]),
+                all_pair_costs,
+                fallback_cost_matrix,
             )
         return c
 
@@ -1355,13 +1695,21 @@ def two_opt_tileaware(
                 window_start = max(0, i - NUM_LOOKBACK)
                 window_end = min(len(best) - 1, j + NUM_LOOKBACK)
 
-                old_window_cost = _window_cost(best, best_positions, window_start, window_end)
+                old_window_cost = _window_cost(
+                    best, best_positions, window_start, window_end
+                )
 
                 # Build candidate with reversed segment
-                candidate = best[:i] + best[i : j + 1][::-1] + best[j + 1:]
+                candidate = best[:i] + best[i : j + 1][::-1] + best[j + 1 :]
+
+                # Check forced edge constraints
+                if forced_pairs and _violates_forced_edges(candidate):
+                    continue
+
                 candidate_positions = dict(best_positions)
 
                 # Re-optimize tile positions at boundary + lookback nodes
+                # but NOT for locked positions
                 boundary_indices = set()
                 for offset in range(NUM_LOOKBACK + 1):
                     if i - offset >= 0:
@@ -1375,6 +1723,12 @@ def two_opt_tileaware(
 
                 for k in sorted(boundary_indices):
                     idx = candidate[k]
+
+                    # Don't change locked positions
+                    if idx in locked_positions:
+                        candidate_positions[idx] = locked_positions[idx]
+                        continue
+
                     candidates_pos = tile_positions_per_image.get(idx, [])
                     if not candidates_pos:
                         continue
@@ -1384,21 +1738,26 @@ def two_opt_tileaware(
 
                     for pos in candidates_pos:
                         cost = 0.0
-                        # Check all edges within lookback range of this node
                         for offset in range(1, NUM_LOOKBACK + 1):
                             if k - offset >= 0:
                                 nb = candidate[k - offset]
                                 cost += lookup_cost(
-                                    nb, idx,
-                                    candidate_positions.get(nb), pos,
-                                    all_pair_costs, fallback_cost_matrix,
+                                    nb,
+                                    idx,
+                                    candidate_positions.get(nb),
+                                    pos,
+                                    all_pair_costs,
+                                    fallback_cost_matrix,
                                 ) * (0.5 ** (offset - 1))
                             if k + offset < len(candidate):
                                 nb = candidate[k + offset]
                                 cost += lookup_cost(
-                                    idx, nb,
-                                    pos, candidate_positions.get(nb),
-                                    all_pair_costs, fallback_cost_matrix,
+                                    idx,
+                                    nb,
+                                    pos,
+                                    candidate_positions.get(nb),
+                                    all_pair_costs,
+                                    fallback_cost_matrix,
                                 ) * (0.5 ** (offset - 1))
 
                         if cost < best_local_cost:
@@ -1408,12 +1767,16 @@ def two_opt_tileaware(
                     if best_pos is not None:
                         candidate_positions[idx] = best_pos
 
-                new_window_cost = _window_cost(candidate, candidate_positions, window_start, window_end)
+                new_window_cost = _window_cost(
+                    candidate, candidate_positions, window_start, window_end
+                )
 
                 if new_window_cost < old_window_cost:
-                    # Verify with full path cost
                     candidate_cost = _path_cost_tileaware(
-                        candidate, candidate_positions, all_pair_costs, fallback_cost_matrix
+                        candidate,
+                        candidate_positions,
+                        all_pair_costs,
+                        fallback_cost_matrix,
                     )
                     if candidate_cost < best_cost:
                         best = candidate
@@ -1424,6 +1787,7 @@ def two_opt_tileaware(
         print(f"  2-opt iteration {iteration}: cost = {best_cost:.2f}")
 
     return best, best_cost, best_positions
+
 
 # ── Tile Position Refinement ────────────────────────────────────────────────
 
@@ -1473,14 +1837,23 @@ def refine_tile_positions(
     refine_stride=REFINE_STRIDE,
     refine_radius=REFINE_RADIUS,
     num_iterations=REFINE_ITERATIONS,
+    forced_edges=None,
 ):
-    
+
     n = len(path)
 
     if face_bboxes is None:
         face_bboxes = {}
     if edge_scales is None:
         edge_scales = {}
+    if forced_edges is None:
+        forced_edges = []
+
+    # Build set of locked image indices (from forced edges)
+    locked_indices = set()
+    for first_idx, last_idx, first_pos, last_pos in forced_edges:
+        locked_indices.add(first_idx)
+        locked_indices.add(last_idx)
 
     # Compute common comparison size across all images in the path
     min_dim = inf
@@ -1528,7 +1901,9 @@ def refine_tile_positions(
         ty, tx, ts = positions[seq_idx]
         return em[ty : ty + ts, tx : tx + ts]
 
-    def neighbor_cost(k, candidate_ty, candidate_tx, candidate_ts, neighbor_tiles, neighbor_indices):
+    def neighbor_cost(
+        k, candidate_ty, candidate_tx, candidate_ts, neighbor_tiles, neighbor_indices
+    ):
         """Compute total cost from a candidate position to all neighbors, including face bonus."""
         cost = 0.0
         for ni, nk in enumerate(neighbor_indices):
@@ -1537,9 +1912,12 @@ def refine_tile_positions(
                 return inf
 
             chamfer = _chamfer_cost_common(
-                edge_maps[filenames[path[k]]][candidate_ty : candidate_ty + candidate_ts,
-                                               candidate_tx : candidate_tx + candidate_ts],
-                nt, common_size
+                edge_maps[filenames[path[k]]][
+                    candidate_ty : candidate_ty + candidate_ts,
+                    candidate_tx : candidate_tx + candidate_ts,
+                ],
+                nt,
+                common_size,
             )
 
             # Face alignment bonus
@@ -1548,11 +1926,16 @@ def refine_tile_positions(
             bboxes_n = scaled_face_bboxes[nk]
             if bboxes_k and bboxes_n:
                 bonus = _face_alignment_bonus(
-                    candidate_ty, candidate_tx, candidate_ts,
-                    nty, ntx, nts,
-                    bboxes_k, bboxes_n
+                    candidate_ty,
+                    candidate_tx,
+                    candidate_ts,
+                    nty,
+                    ntx,
+                    nts,
+                    bboxes_k,
+                    bboxes_n,
                 )
-                chamfer *= (1.0 - min(bonus, 0.9))
+                chamfer *= 1.0 - min(bonus, 0.9)
 
             # Weight by distance: immediate neighbors full weight, lookback decays
             dist = abs(k - nk)
@@ -1577,12 +1960,14 @@ def refine_tile_positions(
                     bonus = _face_alignment_bonus(
                         ay, ax, a_ts, by, bx, b_ts, bboxes_a, bboxes_b
                     )
-                    chamfer *= (1.0 - min(bonus, 0.9))
+                    chamfer *= 1.0 - min(bonus, 0.9)
                 total += chamfer
         return total
 
     initial_cost = compute_total_cost()
     print(f"    Refinement initial cost: {initial_cost:.2f}")
+    if locked_indices:
+        print(f"    Locked indices (from forced edges): {locked_indices}")
 
     for iteration in range(num_iterations):
         changed = False
@@ -1591,9 +1976,14 @@ def refine_tile_positions(
         sweep_order = [0] + sweep_order + [n - 1]
 
         for k in sweep_order:
+            idx = path[k]
+
+            # Skip locked positions (forced edge endpoints)
+            if idx in locked_indices:
+                continue
+
             with open("tile_matching.log", "a") as log:
                 log.write(f"refine {iteration}-{k}\n")
-            idx = path[k]
             fn = filenames[idx]
             em = edge_maps[fn]
             h, w = em.shape
@@ -1618,7 +2008,9 @@ def refine_tile_positions(
             # Evaluate current position
             cur_tile = em[cur_ty : cur_ty + cur_ts, cur_tx : cur_tx + cur_ts]
             if cur_tile.shape[0] == cur_ts and cur_tile.shape[1] == cur_ts:
-                cur_cost = neighbor_cost(k, cur_ty, cur_tx, cur_ts, neighbor_tiles, neighbor_indices)
+                cur_cost = neighbor_cost(
+                    k, cur_ty, cur_tx, cur_ts, neighbor_tiles, neighbor_indices
+                )
                 if cur_cost < inf:
                     best_cost = cur_cost
                     best_pos = (cur_ty, cur_tx, cur_ts)
@@ -1655,7 +2047,9 @@ def refine_tile_positions(
                         if candidate.shape[0] != ts or candidate.shape[1] != ts:
                             continue
 
-                        cost = neighbor_cost(k, ty, tx, ts, neighbor_tiles, neighbor_indices)
+                        cost = neighbor_cost(
+                            k, ty, tx, ts, neighbor_tiles, neighbor_indices
+                        )
                         if cost < best_cost:
                             best_cost = cost
                             best_pos = (ty, tx, ts)
@@ -1680,6 +2074,7 @@ def refine_tile_positions(
 
     return positions
 
+
 # ── Main Sequencing Pipeline ────────────────────────────────────────────────
 
 
@@ -1701,6 +2096,12 @@ def sequence(
         return
 
     print(f"  Tile ratios: {TILE_RATIOS}")
+    if PREPROCESSED_SEQS:
+        print(f"  Pre-sequenced groups: {len(PREPROCESSED_SEQS)}")
+        for seq_name, (first_info, last_info) in PREPROCESSED_SEQS:
+            print(f"    {seq_name}: {first_info[0]} → {last_info[0]}")
+
+    forced_edges = []
 
     if os.path.exists(cache_file) and cache_file != "new":
         print("Step 2/5: Loading cached cost data...")
@@ -1710,6 +2111,7 @@ def sequence(
         all_pair_costs = cached["all_pair_costs"]
         tile_positions_per_image = cached["tile_positions_per_image"]
         fallback_cost_matrix = cached["fallback_cost_matrix"]
+        forced_edges = cached.get("forced_edges", [])
 
         if set(filenames) != set(edge_maps.keys()):
             print("  Cache stale — recomputing.")
@@ -1720,8 +2122,12 @@ def sequence(
                 tile_positions_per_image,
                 fallback_cost_matrix,
                 coarse_dist,
+                forced_edges,
             ) = build_sparse_cost_data(
-                edge_maps, edge_scales, max_workers=max_workers, image_folder=image_folder
+                edge_maps,
+                edge_scales,
+                max_workers=max_workers,
+                image_folder=image_folder,
             )
             with open(cache_file, "wb") as f:
                 pickle.dump(
@@ -1730,6 +2136,7 @@ def sequence(
                         "all_pair_costs": all_pair_costs,
                         "tile_positions_per_image": tile_positions_per_image,
                         "fallback_cost_matrix": fallback_cost_matrix,
+                        "forced_edges": forced_edges,
                     },
                     f,
                 )
@@ -1742,14 +2149,30 @@ def sequence(
             tile_positions_per_image,
             fallback_cost_matrix,
             coarse_dist,
+            forced_edges,
         ) = build_sparse_cost_data(
             edge_maps, edge_scales, max_workers=max_workers, image_folder=image_folder
         )
+        with open(cache_file, "wb") as f:
+            pickle.dump(
+                {
+                    "filenames": filenames,
+                    "all_pair_costs": all_pair_costs,
+                    "tile_positions_per_image": tile_positions_per_image,
+                    "fallback_cost_matrix": fallback_cost_matrix,
+                    "forced_edges": forced_edges,
+                },
+                f,
+            )
     print()
 
     print("Step 3/5: Tile-aware greedy nearest-neighbor path...")
     path, greedy_cost, tile_positions = greedy_nearest_neighbor_tileaware(
-        n, all_pair_costs, fallback_cost_matrix, tile_positions_per_image
+        n,
+        all_pair_costs,
+        fallback_cost_matrix,
+        tile_positions_per_image,
+        forced_edges=forced_edges,
     )
     print(f"  Greedy cost: {greedy_cost:.2f}\n")
 
@@ -1760,28 +2183,51 @@ def sequence(
         all_pair_costs,
         fallback_cost_matrix,
         tile_positions_per_image,
+        forced_edges=forced_edges,
     )
     print(f"  2-opt cost:  {final_cost:.2f}\n")
 
     # One final full position optimization pass on the settled path
+    # but respect locked positions
     print("  Final position optimization on settled path...")
+    locked_positions = {}
+    for first_idx, last_idx, first_pos, last_pos in forced_edges:
+        locked_positions[first_idx] = first_pos
+        locked_positions[last_idx] = last_pos
+    # Apply locked positions before optimization
+    for idx, pos in locked_positions.items():
+        tile_positions[idx] = pos
     final_cost = _optimize_positions_for_path(
         path,
         tile_positions,
         all_pair_costs,
         fallback_cost_matrix,
-        tile_positions_per_image
+        tile_positions_per_image,
     )
+    # Re-apply locked positions (in case optimizer changed them)
+    for idx, pos in locked_positions.items():
+        tile_positions[idx] = pos
     print(f"  Optimized cost: {final_cost:.2f}\n")
 
     print("Step 5/5: Fine-grained tile position refinement...")
-    with open('face_bboxes.json') as f:
+    with open("face_bboxes.json") as f:
         face_bboxes_refine = json.load(f)
     refined_positions = refine_tile_positions(
-        path, filenames, edge_maps, tile_positions,
-        edge_scales=edge_scales, face_bboxes=face_bboxes_refine
+        path,
+        filenames,
+        edge_maps,
+        tile_positions,
+        edge_scales=edge_scales,
+        face_bboxes=face_bboxes_refine,
+        forced_edges=forced_edges,
     )
     print()
+
+    # ── Expand forced edges into full sub-sequences in the output ────────
+    # Build a map from (first_fn, last_fn) -> seq_folder_name
+    seq_lookup = {}
+    for seq_name, (first_info, last_info) in PREPROCESSED_SEQS:
+        seq_lookup[(first_info[0], last_info[0])] = seq_name
 
     with open(output_file, "w") as f:
         for k, idx in enumerate(path):
@@ -1789,6 +2235,37 @@ def sequence(
             em = edge_maps[fn]
             h, w = em.shape
             ty, tx, ts = refined_positions[k]
+
+            # Check if this is the start of a forced edge (sub-sequence)
+            if k + 1 < len(path):
+                next_fn = filenames[path[k + 1]]
+                seq_name = seq_lookup.get((fn, next_fn))
+                if seq_name is not None:
+                    # Write the full sub-sequence from its sequence file
+                    seq_path = os.path.join(image_folder, seq_name, "sequence.txt")
+                    if os.path.exists(seq_path):
+                        with open(seq_path, "r") as sf:
+                            seq_lines = [l.strip() for l in sf if l.strip()]
+                        for sl in seq_lines:
+                            parts = sl.split(",")
+                            sq_fn = parts[0]
+                            sq_ty, sq_tx = int(parts[1]), int(parts[2])
+                            sq_ts = int(parts[3])
+                            sq_h, sq_w = int(parts[4]), int(parts[5])
+                            # Write with sub-folder path so generate_vid can find it
+                            f.write(
+                                f"{os.path.join(seq_name, sq_fn)},"
+                                f"{sq_ty},{sq_tx},{sq_ts},{sq_h},{sq_w}\n"
+                            )
+                        continue  # Skip writing first_fn separately (it's in the sub-seq)
+
+            # Check if this is the last node of a forced edge — already written
+            # as part of the sub-sequence above, so skip
+            if k > 0:
+                prev_fn = filenames[path[k - 1]]
+                if (prev_fn, fn) in seq_lookup:
+                    continue  # Already written as part of the sub-sequence
+
             f.write(f"{fn},{ty},{tx},{ts},{h},{w}\n")
 
     print(f"Sequence written to {output_file}")
@@ -1803,7 +2280,7 @@ def sequence(
 def generate_vid(
     sequence_file,
     foto_folder,
-    output_path="output_v5.mp4",
+    output_path="output_v6.mp4",
     fps=11,
 ):
     entries = []
