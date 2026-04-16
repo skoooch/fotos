@@ -12,7 +12,7 @@ from scipy.ndimage import distance_transform_edt
 import pickle
 
 
-def create_reduced_dir(in_folder, out_folder, scale=2.5):
+def create_reduced_dir(in_folder, out_folder, scale=2.5, long_edge=1400):
     if not os.path.exists(out_folder):
         os.makedirs(out_folder)
     for filename in os.listdir(in_folder):
@@ -27,8 +27,14 @@ def create_reduced_dir(in_folder, out_folder, scale=2.5):
             out_fp = os.path.join(out_folder, filename)
             image = Image.open(in_fp)
             image = ImageOps.exif_transpose(image)
-            size = image.size
-            image = image.resize((int(size[0] // scale), int(size[1] // scale)))
+            w, h = image.size
+            if w >= h:
+                new_w = long_edge
+                new_h = int(h * long_edge / w)
+            else:
+                new_h = long_edge
+                new_w = int(w * long_edge / h)
+            image = image.resize((new_w, new_h))
             image.save(out_fp, quality=20, optimize=True)
 
 
@@ -350,9 +356,9 @@ def vecLD_to_binary_image(vecLD):
 
 
 if __name__ == "__main__":
-    create_reduced_dir("sucre_2", "cusco_salkantay_med", scale=2.5)
-    create_reduced_dir("sucre_3", "cusco_salkantay_med", scale=2.5)
-    create_reduced_dir("la-paz", "cusco_salkantay_med", scale=2.5)
+    create_reduced_dir("uyuni_sucre/rock1", "cusco_salkantay_med/seq_rock1", scale=2.5)
+    create_reduced_dir("uyuni_sucre/rock2", "cusco_salkantay_med/seq_rock2", scale=2.5)
+    create_reduced_dir("uyuni_sucre/rock3", "cusco_salkantay_med/seq_rock3", scale=2.5)
     # create_sobel_folder("cusco_salkantay_small")
 
     # vecLD_arr = compute_contour_info("cusco_salkantay_med_vec/vecLDs.mat", 95, True)
