@@ -356,8 +356,9 @@ def vecLD_to_binary_image(vecLD):
 
 
 if __name__ == "__main__":
-    create_reduced_dir("colombia", "cusco_salkantay_med", scale=2.5)
-    create_reduced_dir("phone", "cusco_salkantay_med", scale=2.5)
+    create_reduced_dir("uyuni_sucre/rock1", "cusco_salkantay_med/seq_rock1", scale=2.5)
+    create_reduced_dir("uyuni_sucre/rock2", "cusco_salkantay_med/seq_rock2", scale=2.5)
+    create_reduced_dir("uyuni_sucre/rock3", "cusco_salkantay_med/seq_rock3", scale=2.5)
     # create_sobel_folder("cusco_salkantay_small")
 
     # vecLD_arr = compute_contour_info("cusco_salkantay_med_vec/vecLDs.mat", 95, True)

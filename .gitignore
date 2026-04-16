@@ -8,6 +8,7 @@
 *.png
 *.yml
 !cusco_salkantay_med/*
+!cusco_salkantay_med/seq*/*
 MLVcode/__pycache__*
 __pycache__/*
 *.pkl
