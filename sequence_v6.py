@@ -2071,7 +2071,7 @@ def refine_tile_positions(
 
 def sequence(
     image_folder,
-    output_file="sequence_order_v3_4lookback.txt",
+    output_file="sequence_order_v3_test.txt",
     cache_file="cost_matrix_cache",
     max_workers=None,
     cache_prefix="",
